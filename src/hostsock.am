@@ -1,0 +1,237 @@
+namespace Amalgame.Bridge
+
+// ── Sockets de l'hôte (Winsock / POSIX), non bloquantes ───────────
+// Utilisées uniquement pour le point de montage local (SOCKS5 sur
+// 127.0.0.1) : tout le trafic vers l'extérieur passe par lwIP.
+// Descripteurs exposés en `int` ; -1 = invalide.
+
+@c {
+    #ifdef _WIN32
+        /* winsock2.h déjà inclus en tête (sys.am). */
+        typedef SOCKET br_sock_t;
+        #define BR_BADSOCK INVALID_SOCKET
+        #define br_closesock closesocket
+        #define BR_WOULDBLOCK(e) ((e) == WSAEWOULDBLOCK)
+        static int br_sock_errno(void) { return WSAGetLastError(); }
+        static void br_nonblock(br_sock_t s) { u_long one = 1; ioctlsocket(s, FIONBIO, &one); }
+    #else
+        #include <errno.h>
+        #include <unistd.h>
+        #include <fcntl.h>
+        #include <sys/socket.h>
+        #include <sys/select.h>
+        #include <netinet/in.h>
+        #include <netinet/tcp.h>
+        #include <arpa/inet.h>
+        #include <signal.h>
+        typedef int br_sock_t;
+        #define BR_BADSOCK (-1)
+        #define br_closesock close
+        #define BR_WOULDBLOCK(e) ((e) == EAGAIN || (e) == EWOULDBLOCK || (e) == EINTR)
+        static int br_sock_errno(void) { return errno; }
+        static void br_nonblock(br_sock_t s) { fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK); }
+    #endif
+
+    /* 0 = données ou rien pour l'instant, 1 = fin de flux, 2 = erreur */
+    static int br_sock_status = 0;
+
+    static int br_sockaddr(const char* host, int port, struct sockaddr_in* sa) {
+        memset(sa, 0, sizeof *sa);
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((unsigned short) port);
+        if (!host || !*host || strcmp(host, "*") == 0) { sa->sin_addr.s_addr = htonl(INADDR_ANY); return 1; }
+        return inet_pton(AF_INET, host, &sa->sin_addr) == 1;
+    }
+}
+
+public class HostDatagram {
+    public Ip:   int
+    public Port: int
+    public Data: List<int>
+    public HostDatagram(int ip, int port, List<int> data) {
+        this.Ip   = ip
+        this.Port = port
+        this.Data = data
+    }
+}
+
+public class HostSock {
+    public HostSock() {}
+
+    public static bool Init() {
+        @c {
+        #ifdef _WIN32
+            WSADATA w;
+            return WSAStartup(MAKEWORD(2, 2), &w) == 0;
+        #else
+            signal(SIGPIPE, SIG_IGN);
+            return 1;
+        #endif
+        }
+    }
+
+    // 0 = ok / rien, 1 = fin de flux, 2 = erreur (après Recv/Send).
+    public static int LastStatus() {
+        @c { return (i64) br_sock_status; }
+    }
+
+    public static int ListenTcp(string host, int port) {
+        @c {
+            struct sockaddr_in sa;
+            if (!br_sockaddr(host, (int) port, &sa)) return -1;
+            br_sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s == BR_BADSOCK) return -1;
+            int one = 1;
+        #ifdef _WIN32
+            setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*) &one, sizeof one);
+        #else
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        #endif
+            if (bind(s, (struct sockaddr*) &sa, sizeof sa) != 0 || listen(s, 128) != 0) { br_closesock(s); return -1; }
+            br_nonblock(s);
+            return (i64) s;
+        }
+    }
+
+    public static int Accept(int lfd) {
+        @c {
+            br_sock_t c = accept((br_sock_t) lfd, NULL, NULL);
+            if (c == BR_BADSOCK) return -1;
+            br_nonblock(c);
+            int one = 1;
+            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof one);
+            return (i64) c;
+        }
+    }
+
+    // Jusqu'à `max` octets ; liste vide si rien (voir LastStatus()).
+    public static List<int> Recv(int fd, int max) {
+        @c {
+            static uint8_t buf[65536];
+            int cap = max > (i64) sizeof buf ? (int) sizeof buf : (int) max;
+            br_sock_status = 0;
+            AmalgameList* r = AmalgameList_new();
+            if (cap <= 0) return r;
+            int n = (int) recv((br_sock_t) fd, (char*) buf, cap, 0);
+            if (n == 0) { br_sock_status = 1; return r; }
+            if (n < 0) { if (!BR_WOULDBLOCK(br_sock_errno())) br_sock_status = 2; return r; }
+            AmalgameList_reserve(r, n);
+            for (int i = 0; i < n; i++) r->data[i] = (void*)(intptr_t) buf[i];
+            r->size = n;
+            return r;
+        }
+    }
+
+    // Octets envoyés (0 si le tampon noyau est plein) ; -1 sur erreur.
+    public static int Send(int fd, List<int> data, int off, int len) {
+        @c {
+            br_sock_status = 0;
+            if (!data || off < 0 || len <= 0 || off + len > data->size) return 0;
+            uint8_t* b = (uint8_t*) GC_MALLOC_ATOMIC((size_t) len);
+            for (int i = 0; i < (int) len; i++) b[i] = (uint8_t)((intptr_t) data->data[off + i] & 0xff);
+        #ifdef MSG_NOSIGNAL
+            int n = (int) send((br_sock_t) fd, (const char*) b, (int) len, MSG_NOSIGNAL);
+        #else
+            int n = (int) send((br_sock_t) fd, (const char*) b, (int) len, 0);
+        #endif
+            if (n < 0) {
+                if (BR_WOULDBLOCK(br_sock_errno())) return 0;
+                br_sock_status = 2;
+                return -1;
+            }
+            return (i64) n;
+        }
+    }
+
+    public static void ShutdownWrite(int fd) {
+        @c {
+        #ifdef _WIN32
+            shutdown((br_sock_t) fd, SD_SEND);
+        #else
+            shutdown((br_sock_t) fd, SHUT_WR);
+        #endif
+        }
+    }
+
+    public static void Close(int fd) {
+        if (fd < 0) { return }
+        @c { br_closesock((br_sock_t) fd); }
+    }
+
+    // ── UDP (relais SOCKS5 UDP ASSOCIATE) ───────────────
+    public static int UdpBind(string host, int port) {
+        @c {
+            struct sockaddr_in sa;
+            if (!br_sockaddr(host, (int) port, &sa)) return -1;
+            br_sock_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (s == BR_BADSOCK) return -1;
+            if (bind(s, (struct sockaddr*) &sa, sizeof sa) != 0) { br_closesock(s); return -1; }
+            br_nonblock(s);
+            return (i64) s;
+        }
+    }
+
+    public static int LocalPort(int fd) {
+        @c {
+            struct sockaddr_in sa; socklen_t l = sizeof sa;
+            if (getsockname((br_sock_t) fd, (struct sockaddr*) &sa, &l) != 0) return 0;
+            return (i64) ntohs(sa.sin_port);
+        }
+    }
+
+    public static HostDatagram RecvFrom(int fd) {
+        var ip: int = 0
+        var port: int = 0
+        var data: List<int> = null
+        @c {
+            static uint8_t buf[65536];
+            struct sockaddr_in sa; socklen_t l = sizeof sa;
+            int n = (int) recvfrom((br_sock_t) fd, (char*) buf, sizeof buf, 0, (struct sockaddr*) &sa, &l);
+            if (n >= 0) {
+                ip = (i64) ntohl(sa.sin_addr.s_addr);
+                port = (i64) ntohs(sa.sin_port);
+                data = AmalgameList_newWithCapacity(n);
+                for (int i = 0; i < n; i++) data->data[i] = (void*)(intptr_t) buf[i];
+                data->size = n;
+            }
+        }
+        if (data == null) { return null }
+        return new HostDatagram(ip, port, data)
+    }
+
+    public static bool SendTo(int fd, int ip, int port, List<int> data, int off, int len) {
+        @c {
+            if (!data || off < 0 || len < 0 || off + len > data->size) return 0;
+            uint8_t* b = (uint8_t*) GC_MALLOC_ATOMIC(len > 0 ? (size_t) len : 1);
+            for (int i = 0; i < (int) len; i++) b[i] = (uint8_t)((intptr_t) data->data[off + i] & 0xff);
+            struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = htonl((uint32_t) ip);
+            sa.sin_port = htons((unsigned short) port);
+            return sendto((br_sock_t) fd, (const char*) b, (int) len, 0, (struct sockaddr*) &sa, sizeof sa) >= 0;
+        }
+    }
+
+    // Attend qu'un des descripteurs soit lisible, au plus `ms` ms.
+    public static void Wait(List<int> fds, int ms) {
+        @c {
+            fd_set rs; FD_ZERO(&rs);
+            br_sock_t maxfd = 0;
+            int n = fds ? fds->size : 0;
+            if (n > FD_SETSIZE) n = FD_SETSIZE;
+            for (int i = 0; i < n; i++) {
+                br_sock_t s = (br_sock_t)(intptr_t) fds->data[i];
+                if ((intptr_t) fds->data[i] < 0) continue;
+                FD_SET(s, &rs);
+                if (s > maxfd) maxfd = s;
+            }
+            struct timeval tv;
+            tv.tv_sec = (long)(ms / 1000);
+            tv.tv_usec = (long)((ms % 1000) * 1000);
+        #ifdef _WIN32
+            if (rs.fd_count == 0) { Sleep((DWORD) ms); return; }
+        #endif
+            select((int) maxfd + 1, &rs, NULL, NULL, &tv);
+        }
+    }
+}

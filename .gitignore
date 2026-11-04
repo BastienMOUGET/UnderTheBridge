@@ -1,0 +1,5 @@
+/build/
+/dist/
+bridge.conf
+*.log
+/package/

@@ -1,0 +1,188 @@
+namespace Amalgame.Bridge
+
+// ── Primitives système : horloge monotone, aléa, journal ──────────
+
+@c {
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <time.h>
+    #ifdef _WIN32
+        #ifndef _WIN32_WINNT
+            #define _WIN32_WINNT 0x0601
+        #endif
+        /* sys.am est le premier fichier compilé : winsock2.h doit
+         * précéder windows.h pour toute l'unité de traduction. */
+        #ifndef FD_SETSIZE
+            #define FD_SETSIZE 1024   /* défaut Winsock : 64 sockets par select() */
+        #endif
+        #include <winsock2.h>
+        #include <ws2tcpip.h>
+        #include <windows.h>
+    #else
+        #include <unistd.h>
+        #include <sys/time.h>
+    #endif
+
+    static FILE* br_log_file = NULL;
+    static int   br_log_level = 1;   /* 0 debug, 1 info, 2 warn, 3 error */
+    static int   br_log_console = 1;
+    static uint64_t br_rand_state = 0;
+
+    static uint64_t br_rand_next(void) {
+        if (br_rand_state == 0) {
+        #ifdef _WIN32
+            LARGE_INTEGER c; QueryPerformanceCounter(&c);
+            br_rand_state = (uint64_t) c.QuadPart ^ ((uint64_t) GetCurrentProcessId() << 32);
+        #else
+            struct timeval tv; gettimeofday(&tv, NULL);
+            br_rand_state = ((uint64_t) tv.tv_sec << 20) ^ (uint64_t) tv.tv_usec ^ ((uint64_t) getpid() << 40);
+        #endif
+            br_rand_state |= 1;
+        }
+        /* xorshift64* */
+        br_rand_state ^= br_rand_state >> 12;
+        br_rand_state ^= br_rand_state << 25;
+        br_rand_state ^= br_rand_state >> 27;
+        return br_rand_state * 2685821657736338717ULL;
+    }
+}
+
+public class Clock {
+    public Clock() {}
+
+    // Millisecondes monotones (origine arbitraire).
+    public static int NowMs() {
+        @c {
+        #ifdef _WIN32
+            return (i64) GetTickCount64();
+        #else
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return (i64) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        #endif
+        }
+    }
+}
+
+public class Rand {
+    public Rand() {}
+
+    // Graine fixe — tests déterministes.
+    public static void Seed(int s) {
+        @c { br_rand_state = (uint64_t) s | 1; }
+    }
+
+    public static int U32() {
+        @c { return (i64) (br_rand_next() >> 32); }
+    }
+
+    // Entier dans [lo, hi).
+    public static int Range(int lo, int hi) {
+        if (hi <= lo) { return lo }
+        return lo + (Rand.U32() % (hi - lo))
+    }
+}
+
+public class Log {
+    public Log() {}
+
+    // "debug" | "info" | "warn" | "error"
+    public static void SetLevel(string level) {
+        var n: int = 1
+        if (level == "debug") { n = 0 }
+        if (level == "warn")  { n = 2 }
+        if (level == "error") { n = 3 }
+        @c { br_log_level = (int) n; }
+    }
+
+    public static void SetConsole(bool on) {
+        @c { br_log_console = on ? 1 : 0; }
+    }
+
+    // Ajoute les lignes au fichier (en plus de la console si activée).
+    public static bool SetFile(string path) {
+        @c {
+            if (br_log_file) { fclose(br_log_file); br_log_file = NULL; }
+            if (!path || !*path) return 1;
+            br_log_file = fopen(path, "a");
+            return br_log_file != NULL;
+        }
+    }
+
+    public static bool IsDebug() {
+        @c { return br_log_level == 0; }
+    }
+
+    public static void Debug(string msg) { Log.Write(0, "DEBUG", msg) }
+    public static void Info(string msg)  { Log.Write(1, "INFO ", msg) }
+    public static void Warn(string msg)  { Log.Write(2, "WARN ", msg) }
+    public static void Error(string msg) { Log.Write(3, "ERROR", msg) }
+
+    private static void Write(int level, string tag, string msg) {
+        @c {
+            if (level < br_log_level) return;
+            char ts[32];
+            time_t now = time(NULL);
+            struct tm tmv;
+        #ifdef _WIN32
+            localtime_s(&tmv, &now);
+        #else
+            localtime_r(&now, &tmv);
+        #endif
+            strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
+            if (br_log_console) {
+                fprintf(level >= 2 ? stderr : stdout, "%s %s %s\n", ts, tag, msg);
+                fflush(level >= 2 ? stderr : stdout);
+            }
+            if (br_log_file) {
+                fprintf(br_log_file, "%s %s %s\n", ts, tag, msg);
+                fflush(br_log_file);
+            }
+        }
+    }
+}
+
+public class Sys {
+    public Sys() {}
+
+    // Dossier de l'exécutable (sans séparateur final). Un service
+    // Windows démarre dans System32 : la config se cherche ici.
+    public static string ExeDir() {
+        @c {
+            char* buf = (char*) GC_MALLOC_ATOMIC(4096);
+        #ifdef _WIN32
+            DWORD n = GetModuleFileNameA(NULL, buf, 4096);
+            if (n == 0 || n >= 4096) return ".";
+            char* p = strrchr(buf, '\\');
+        #else
+            ssize_t n = readlink("/proc/self/exe", buf, 4095);
+            if (n <= 0) return ".";
+            buf[n] = 0;
+            char* p = strrchr(buf, '/');
+        #endif
+            if (!p) return ".";
+            *p = 0;
+            return buf;
+        }
+    }
+
+    // Console Windows en UTF-8 (accents des journaux et noms d'interfaces).
+    public static void InitConsole() {
+        @c {
+        #ifdef _WIN32
+            SetConsoleOutputCP(CP_UTF8);
+        #endif
+        }
+    }
+
+    public static string PathSep() {
+        @c {
+        #ifdef _WIN32
+            return "\\";
+        #else
+            return "/";
+        #endif
+        }
+    }
+}

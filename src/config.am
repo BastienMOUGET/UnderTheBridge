@@ -1,0 +1,187 @@
+namespace Amalgame.Bridge
+
+// ── Configuration (bridge.conf, format clé = valeur) ──────────────
+// Voir bridge.conf.example pour la liste commentée des clés.
+
+public class BridgeConfig {
+    public Interface:   string
+    public MacMode:     string     // "auto" | "host" | MAC explicite
+    public Mode:        string     // "dhcp" | "static"
+    public Ip:          int
+    public Mask:        int
+    public Gateway:     int
+    public Dns:         List<int>
+    public Mtu:         int
+    public Hostname:    string
+    public DhcpClientId: string    // "auto" | "none" | texte libre
+    public Socks:       SocksConfig
+    public LogLevel:    string
+    public LogFile:     string
+    public ServiceName: string
+    public Errors:      List<string>
+
+    public BridgeConfig() {
+        this.Interface   = "auto"
+        this.MacMode     = "auto"
+        this.Mode        = "dhcp"
+        this.Ip          = 0
+        this.Mask        = 0
+        this.Gateway     = 0
+        this.Dns         = new List<int>()
+        this.Mtu         = 1500
+        this.Hostname    = "amalgame-bridge"
+        this.DhcpClientId = "auto"
+        this.Socks       = new SocksConfig()
+        this.LogLevel    = "info"
+        this.LogFile     = ""
+        this.ServiceName = "UnderTheBridge"
+        this.Errors      = new List<string>()
+    }
+
+    public static BridgeConfig Load(string path) {
+        let c = new BridgeConfig()
+        if (!File.Exists(path)) {
+            c.Errors.Add("fichier de configuration introuvable : " + path)
+            return c
+        }
+        let lines: List<string> = String.Split(File.ReadAll(path), "\n")
+        for i in 0..lines.Count() {
+            let raw: string = lines.Get(i)
+            let line: string = String.Trim(String.Replace(raw, "\r", ""))
+            if (String.Length(line) == 0 || String.StartsWith(line, "#") || String.StartsWith(line, ";")) {
+                continue
+            }
+            let eq: int = String.IndexOf(line, "=")
+            if (eq <= 0) {
+                c.Errors.Add("ligne " + String.FromInt(i + 1) + " ignorée (pas de '=') : " + line)
+                continue
+            }
+            let key: string = String.ToLower(String.Trim(String.Until(line, eq)))
+            let value: string = String.Trim(String.From(line, eq + 1))
+            c.Set(key, value, i + 1)
+        }
+        return c
+    }
+
+    public void Set(string key, string value, int lineNo) {
+        let where: string = " (ligne " + String.FromInt(lineNo) + ")"
+        if (key == "interface")     { this.Interface = value; return }
+        if (key == "mac")           { this.MacMode = String.ToLower(value); return }
+        if (key == "mode")          { this.Mode = String.ToLower(value); return }
+        if (key == "hostname")      { this.Hostname = value; return }
+        if (key == "dhcp_client_id") { this.DhcpClientId = value; return }
+        if (key == "log_level")     { this.LogLevel = String.ToLower(value); return }
+        if (key == "log_file")      { this.LogFile = value; return }
+        if (key == "service_name")  { this.ServiceName = value; return }
+        if (key == "socks_user")    { this.Socks.Username = value; return }
+        if (key == "socks_password") { this.Socks.Password = value; return }
+        if (key == "mtu") {
+            this.Mtu = String.ToInt(value)
+            if (this.Mtu < 576 || this.Mtu > 1500) { this.Errors.Add("mtu hors de [576, 1500]" + where) }
+            return
+        }
+        if (key == "socks_max_sessions") {
+            this.Socks.MaxSessions = String.ToInt(value)
+            return
+        }
+        if (key == "ip" || key == "mask" || key == "gateway") {
+            let v: int = Addr.ParseIp(value)
+            if (v < 0) {
+                this.Errors.Add("adresse invalide pour " + key + where + " : " + value)
+                return
+            }
+            if (key == "ip") { this.Ip = v }
+            if (key == "mask") { this.Mask = v }
+            if (key == "gateway") { this.Gateway = v }
+            return
+        }
+        if (key == "dns") {
+            let parts: List<string> = String.Split(value, ",")
+            for i in 0..parts.Count() {
+                let p: string = String.Trim(parts.Get(i))
+                if (String.Length(p) == 0) { continue }
+                let v: int = Addr.ParseIp(p)
+                if (v < 0) {
+                    this.Errors.Add("serveur DNS invalide" + where + " : " + p)
+                } else {
+                    this.Dns.Add(v)
+                }
+            }
+            return
+        }
+        if (key == "socks_listen") {
+            let colon: int = String.LastIndexOf(value, ":")
+            if (colon <= 0) {
+                this.Errors.Add("socks_listen attendu sous la forme hôte:port" + where)
+                return
+            }
+            this.Socks.ListenHost = String.Until(value, colon)
+            this.Socks.ListenPort = String.ToInt(String.From(value, colon + 1))
+            return
+        }
+        this.Errors.Add("clé inconnue '" + key + "'" + where)
+    }
+
+    // Contrôles de cohérence ; ajoute aux Errors, vrai si utilisable.
+    public bool Validate() {
+        if (this.Interface == "") { this.Errors.Add("'interface' est obligatoire : auto ou un nom (voir --list-interfaces)") }
+        if (this.Mode != "dhcp" && this.Mode != "static") { this.Errors.Add("'mode' doit valoir dhcp ou static") }
+        if (this.Mode == "static" && (this.Ip == 0 || this.Mask == 0)) {
+            this.Errors.Add("mode static : 'ip' et 'mask' sont obligatoires")
+        }
+        if (this.MacMode != "auto" && this.MacMode != "host" && Addr.ParseMac(this.MacMode).Count() != 6) {
+            this.Errors.Add("'mac' doit valoir auto, host ou une adresse aa:bb:cc:dd:ee:ff")
+        }
+        if (String.Length(this.DhcpClientId) > 60) { this.Errors.Add("dhcp_client_id trop long (60 max)") }
+        if (this.Socks.ListenPort <= 0 || this.Socks.ListenPort > 65535) { this.Errors.Add("port SOCKS invalide") }
+        if (this.Socks.Username != "" && this.Socks.Password == "") {
+            this.Errors.Add("socks_user défini sans socks_password")
+        }
+        if (this.Socks.ListenHost != "127.0.0.1" && this.Socks.Username == "") {
+            this.Errors.Add("SOCKS exposé hors de 127.0.0.1 sans authentification : définir socks_user/socks_password")
+        }
+        return this.Errors.Count() == 0
+    }
+
+    // Identifiant client DHCP (option 61).
+    //   auto : MAC partagée avec Windows → identifiant texte propre à la
+    //          pile (« bridge-<mac> ») pour obtenir un bail distinct ;
+    //          MAC propre → forme standard 01 + MAC.
+    //   none : pas d'option 61 (le serveur identifie par la MAC).
+    //   autre : texte libre (type 0).
+    public List<int> ResolveClientId(List<int> stackMac, List<int> hostMac) {
+        let id = new List<int>()
+        if (this.DhcpClientId == "none") { return id }
+        if (this.DhcpClientId == "auto") {
+            if (Addr.SameMac(stackMac, 0, hostMac)) {
+                id.Add(0)
+                Bytes.Append(id, Bytes.FromString("bridge-" + Bytes.Hex(stackMac, 0, 6)))
+            } else {
+                id.Add(1)
+                Bytes.Append(id, stackMac)
+            }
+            return id
+        }
+        id.Add(0)
+        Bytes.Append(id, Bytes.FromString(this.DhcpClientId))
+        return id
+    }
+
+    // MAC effective de la pile à partir de celle de la carte.
+    //   host : celle de la carte (indispensable en Wi-Fi : un point
+    //          d'accès n'accepte qu'une MAC par station associée).
+    //   auto : MAC administrée localement, stable, dérivée de la carte
+    //          → le serveur DHCP voit un client distinct (Ethernet).
+    public List<int> ResolveMac(List<int> hostMac) {
+        if (this.MacMode == "host") { return hostMac }
+        if (this.MacMode != "auto") { return Addr.ParseMac(this.MacMode) }
+        let m = new List<int>()
+        m.Add((Bytes.U8(hostMac, 0) | 0x02) & 0xFE)
+        m.Add(Bytes.U8(hostMac, 1))
+        m.Add(Bytes.U8(hostMac, 2))
+        m.Add(Bytes.U8(hostMac, 3) ^ 0x5A)
+        m.Add(Bytes.U8(hostMac, 4) ^ 0xA5)
+        m.Add(Bytes.U8(hostMac, 5))
+        return m
+    }
+}

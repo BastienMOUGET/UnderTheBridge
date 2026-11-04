@@ -1,0 +1,311 @@
+namespace Amalgame.Bridge
+
+// ── Façade Amalgame sur la pile lwIP (src/native/bridge_lwip.c) ───
+//
+// lwIP fournit ARP, IPv4 (+ réassemblage), ICMP, UDP, TCP, DHCP
+// (avec détection de conflit RFC 5227) et DNS. Ces classes ne font
+// que traduire handles et tampons entre Amalgame et C.
+
+@c {
+    #include "bridge_lwip.h"
+
+    /* Copie list[off, off+len) dans un tampon C (GC, atomique). */
+    static uint8_t* br_list_bytes(AmalgameList* l, int off, int len) {
+        uint8_t* b = (uint8_t*) GC_MALLOC_ATOMIC(len > 0 ? (size_t) len : 1);
+        for (int i = 0; i < len; i++) b[i] = (uint8_t)((intptr_t) l->data[off + i] & 0xff);
+        return b;
+    }
+
+    static AmalgameList* br_bytes_list(const uint8_t* b, int n) {
+        AmalgameList* r = AmalgameList_newWithCapacity(n);
+        for (int i = 0; i < n; i++) r->data[i] = (void*)(intptr_t) b[i];
+        r->size = n;
+        return r;
+    }
+}
+
+public class Net {
+    public Net() {}
+
+    // Timers lwIP (retransmissions, DHCP, ARP, DNS) + boucle locale.
+    public static void Poll() {
+        @c { brl_poll(); }
+    }
+
+    public static void SetStatic(int ip, int mask, int gw) {
+        @c { brl_set_static((uint32_t) ip, (uint32_t) mask, (uint32_t) gw); }
+    }
+
+    // Option 61 envoyée dans chaque message DHCP (vide = aucune).
+    public static void SetDhcpClientId(List<int> id) {
+        @c {
+            uint8_t b[64]; int n = id ? id->size : 0;
+            if (n > 64) n = 64;
+            for (int i = 0; i < n; i++) b[i] = (uint8_t)((intptr_t) id->data[i] & 0xff);
+            brl_set_dhcp_client_id(b, n);
+        }
+    }
+
+    public static bool DhcpStart() {
+        @c { return brl_dhcp_start() == 0; }
+    }
+
+    // État DHCP lisible (journal de progression).
+    public static string DhcpState() {
+        @c {
+            static char buf[64];
+            const char* n;
+            switch (brl_dhcp_state()) {
+                case -1: n = "inactif"; break;
+                case 0:  n = "OFF"; break;
+                case 1:  n = "REQUESTING"; break;
+                case 2:  n = "INIT"; break;
+                case 3:  n = "REBOOTING"; break;
+                case 4:  n = "REBINDING"; break;
+                case 5:  n = "RENEWING"; break;
+                case 6:  n = "SELECTING"; break;
+                case 7:  n = "INFORMING"; break;
+                case 8:  n = "CHECKING (sonde ARP de conflit)"; break;
+                case 10: n = "BOUND"; break;
+                case 12: n = "BACKING_OFF (adresse refusée : conflit ?)"; break;
+                default: n = "?"; break;
+            }
+            snprintf(buf, sizeof buf, "%s, essai %d", n, brl_dhcp_tries());
+            return buf;
+        }
+    }
+
+    public static void DhcpRelease() {
+        @c { brl_dhcp_release(); }
+    }
+
+    public static int Ip() {
+        @c { return (i64) brl_ip(); }
+    }
+
+    public static int Mask() {
+        @c { return (i64) brl_mask(); }
+    }
+
+    public static int Gateway() {
+        @c { return (i64) brl_gw(); }
+    }
+
+    public static int DnsServer(int i) {
+        @c { return (i64) brl_dns_server((int) i); }
+    }
+
+    public static void SetDnsServer(int i, int ip) {
+        @c { brl_set_dns_server((int) i, (uint32_t) ip); }
+    }
+
+    // Serveur echo TCP sur notre propre IP (auto-test).
+    public static bool ListenEcho(int port) {
+        @c { return brl_tcp_listen_echo((int) port) == 0; }
+    }
+}
+
+// Connexion TCP sortante portée par lwIP.
+public class TcpStream {
+    public Handle: int
+
+    public TcpStream(int handle) {
+        this.Handle = handle
+    }
+
+    // null si la pile ne peut pas créer la connexion (pas d'IP, plus de PCB…).
+    public static TcpStream Connect(int ip, int port) {
+        var h: int = -1
+        @c { h = brl_tcp_connect((uint32_t) ip, (int) port); }
+        if (h < 0) { return null }
+        return new TcpStream(h)
+    }
+
+    public bool IsConnecting() {
+        let h: int = this.Handle
+        @c { return brl_tcp_state((int) h) == BRL_TCP_CONNECTING; }
+    }
+
+    public bool IsOpen() {
+        let h: int = this.Handle
+        @c { return brl_tcp_state((int) h) == BRL_TCP_OPEN; }
+    }
+
+    public bool IsClosed() {
+        let h: int = this.Handle
+        @c { return brl_tcp_state((int) h) == BRL_TCP_CLOSED; }
+    }
+
+    // "" | "refused" | "timeout" | "reset" | "error"
+    public string Error() {
+        let h: int = this.Handle
+        @c {
+            switch (brl_tcp_error((int) h)) {
+                case BRL_ERR_NONE:    return "";
+                case BRL_ERR_REFUSED: return "refused";
+                case BRL_ERR_TIMEOUT: return "timeout";
+                case BRL_ERR_RESET:   return "reset";
+                default:              return "error";
+            }
+        }
+    }
+
+    public int LocalPort() {
+        let h: int = this.Handle
+        @c { return (i64) brl_tcp_local_port((int) h); }
+    }
+
+    public int WriteRoom() {
+        let h: int = this.Handle
+        @c { return (i64) brl_tcp_write_room((int) h); }
+    }
+
+    // Écrit data[off, off+len) ; renvoie le nombre d'octets acceptés.
+    public int Write(List<int> data, int off, int len) {
+        let h: int = this.Handle
+        @c {
+            if (!data || off < 0 || len <= 0 || off + len > data->size) return 0;
+            uint8_t* b = br_list_bytes(data, (int) off, (int) len);
+            return (i64) brl_tcp_write((int) h, b, (int) len);
+        }
+    }
+
+    public int Readable() {
+        let h: int = this.Handle
+        @c { return (i64) brl_tcp_readable((int) h); }
+    }
+
+    public List<int> Read(int max) {
+        let h: int = this.Handle
+        @c {
+            int n = brl_tcp_readable((int) h);
+            if (n > max) n = (int) max;
+            if (n <= 0) return AmalgameList_new();
+            uint8_t* b = (uint8_t*) GC_MALLOC_ATOMIC((size_t) n);
+            int got = brl_tcp_read((int) h, b, n);
+            return br_bytes_list(b, got);
+        }
+    }
+
+    // FIN reçu et tout a été lu.
+    public bool AtEof() {
+        let h: int = this.Handle
+        @c { return brl_tcp_eof((int) h) != 0; }
+    }
+
+    public void ShutdownWrite() {
+        let h: int = this.Handle
+        @c { brl_tcp_shutdown_write((int) h); }
+    }
+
+    public void Abort() {
+        let h: int = this.Handle
+        @c { brl_tcp_abort((int) h); }
+    }
+
+    // Rend le handle (fermeture ordonnée si encore ouverte).
+    public void Release() {
+        let h: int = this.Handle
+        if (h < 0) { return }
+        @c { brl_tcp_release((int) h); }
+        this.Handle = -1
+    }
+}
+
+public class UdpPacket {
+    public Ip:   int
+    public Port: int
+    public Data: List<int>
+    public UdpPacket(int ip, int port, List<int> data) {
+        this.Ip   = ip
+        this.Port = port
+        this.Data = data
+    }
+}
+
+// Socket UDP de la pile, port local éphémère.
+public class UdpEndpoint {
+    public Handle: int
+
+    public UdpEndpoint(int handle) {
+        this.Handle = handle
+    }
+
+    public static UdpEndpoint Open() {
+        var h: int = -1
+        @c { h = brl_udp_open(); }
+        if (h < 0) { return null }
+        return new UdpEndpoint(h)
+    }
+
+    public int LocalPort() {
+        let h: int = this.Handle
+        @c { return (i64) brl_udp_local_port((int) h); }
+    }
+
+    public bool SendTo(int ip, int port, List<int> data, int off, int len) {
+        let h: int = this.Handle
+        @c {
+            if (!data || off < 0 || len < 0 || off + len > data->size) return 0;
+            uint8_t* b = br_list_bytes(data, (int) off, (int) len);
+            return brl_udp_sendto((int) h, (uint32_t) ip, (int) port, b, (int) len) == 0;
+        }
+    }
+
+    // null si rien en attente.
+    public UdpPacket Recv() {
+        let h: int = this.Handle
+        var ip: int = 0
+        var port: int = 0
+        var data: List<int> = null
+        @c {
+            static uint8_t buf[65536];
+            uint32_t sip = 0; int sport = 0;
+            int n = brl_udp_recv((int) h, &sip, &sport, buf, sizeof buf);
+            if (n >= 0) { ip = sip; port = sport; data = br_bytes_list(buf, n); }
+        }
+        if (data == null) { return null }
+        return new UdpPacket(ip, port, data)
+    }
+
+    public void Close() {
+        let h: int = this.Handle
+        if (h < 0) { return }
+        @c { brl_udp_close((int) h); }
+        this.Handle = -1
+    }
+}
+
+// Résolution DNS asynchrone (serveurs fournis par DHCP ou la config).
+public class DnsLookup {
+    public Handle: int
+    public Name:   string
+
+    public DnsLookup(int handle, string name) {
+        this.Handle = handle
+        this.Name   = name
+    }
+
+    public static DnsLookup Start(string name) {
+        var h: int = -1
+        @c { h = brl_dns_query(name); }
+        return new DnsLookup(h, name)
+    }
+
+    // 0 en cours, 1 résolu, -1 échec.
+    public int Status() {
+        let h: int = this.Handle
+        @c { uint32_t ip; return (i64) brl_dns_result((int) h, &ip); }
+    }
+
+    public int Address() {
+        let h: int = this.Handle
+        @c { uint32_t ip = 0; brl_dns_result((int) h, &ip); return (i64) ip; }
+    }
+
+    public void Free() {
+        let h: int = this.Handle
+        @c { brl_dns_free((int) h); }
+        this.Handle = -1
+    }
+}

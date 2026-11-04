@@ -1,0 +1,778 @@
+namespace Amalgame.Bridge
+
+// ── Point de montage : serveur SOCKS5 (RFC 1928 / RFC 1929) ───────
+//
+// Les applications se connectent en local (127.0.0.1:1080 par
+// défaut) ; chaque requête est rejouée par la pile lwIP sur
+// l'interface désignée :
+//
+//   CONNECT        → TcpStream lwIP, relais bidirectionnel avec
+//                    contre-pression (on ne lit côté application que
+//                    ce que lwIP peut accepter, et inversement).
+//   UDP ASSOCIATE  → socket UDP locale ↔ UdpEndpoint lwIP.
+//   BIND           → non supporté (réponse 0x07).
+//
+// Les noms de domaine (ATYP 3) sont résolus par le DNS de la pile,
+// donc via l'interface désignée et les serveurs fournis par DHCP.
+//
+// Le même port accepte aussi HTTP CONNECT (RFC 9110 §9.3.6), pour les
+// clients qui ne parlent pas SOCKS (Claude Code, outils Node/npm, pip…) :
+// le premier octet décide — 0x05 = SOCKS5, sinon requête HTTP.
+
+public class SocksConfig {
+    public ListenHost: string
+    public ListenPort: int
+    public Username:   string     // "" = sans authentification
+    public Password:   string
+    public MaxSessions: int
+
+    public SocksConfig() {
+        this.ListenHost  = "127.0.0.1"
+        this.ListenPort  = 1080
+        this.Username    = ""
+        this.Password    = ""
+        this.MaxSessions = 512
+    }
+}
+
+// Datagramme UDP en attente de résolution DNS.
+public class UdpPendingName {
+    public Lookup: DnsLookup
+    public Port:   int
+    public Data:   List<int>
+    public Since:  int
+    public UdpPendingName(DnsLookup lookup, int port, List<int> data, int since) {
+        this.Lookup = lookup
+        this.Port   = port
+        this.Data   = data
+        this.Since  = since
+    }
+}
+
+public class UdpAssociation {
+    public HostFd:     int           // socket locale côté application
+    public ClientIp:   int           // appris au premier datagramme
+    public ClientPort: int
+    public Endpoint:   UdpEndpoint   // socket lwIP côté réseau
+    public Pending:    List<UdpPendingName>
+
+    public UdpAssociation(int hostFd, UdpEndpoint ep) {
+        this.HostFd     = hostFd
+        this.ClientIp   = 0
+        this.ClientPort = 0
+        this.Endpoint   = ep
+        this.Pending    = new List<UdpPendingName>()
+    }
+
+    public void Pump(int now) {
+        // Application → réseau
+        var spin: int = 0
+        while (spin < 64) {
+            spin = spin + 1
+            let d: HostDatagram = HostSock.RecvFrom(this.HostFd)
+            if (d == null) { break }
+            if (d.Ip != 0x7F000001 && this.ClientIp != 0 && d.Ip != this.ClientIp) { continue }
+            this.ClientIp   = d.Ip
+            this.ClientPort = d.Port
+            this.FromClient(d.Data, now)
+        }
+        // Noms résolus
+        var i: int = 0
+        while (i < this.Pending.Count()) {
+            let p: UdpPendingName = this.Pending.Get(i)
+            let st: int = p.Lookup.Status()
+            if (st == 0 && now - p.Since < 10000) {
+                i = i + 1
+                continue
+            }
+            if (st == 1) {
+                this.Endpoint.SendTo(p.Lookup.Address(), p.Port, p.Data, 0, p.Data.Count())
+            }
+            p.Lookup.Free()
+            this.Pending.RemoveAt(i)
+        }
+        // Réseau → application
+        var g2: int = 0
+        while (g2 < 64 && this.ClientPort != 0) {
+            g2 = g2 + 1
+            let r: UdpPacket = this.Endpoint.Recv()
+            if (r == null) { break }
+            let out = new List<int>()
+            out.Reserve(10 + r.Data.Count())
+            Bytes.Put16(out, 0)
+            Bytes.Put8(out, 0)
+            Bytes.Put8(out, 1)
+            Bytes.Put32(out, r.Ip)
+            Bytes.Put16(out, r.Port)
+            Bytes.Append(out, r.Data)
+            HostSock.SendTo(this.HostFd, this.ClientIp, this.ClientPort, out, 0, out.Count())
+        }
+    }
+
+    // En-tête RFC 1928 §7 : RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
+    private void FromClient(List<int> b, int now) {
+        if (b.Count() < 10 || Bytes.U8(b, 2) != 0) { return }   // fragmentation SOCKS non gérée
+        let atyp: int = Bytes.U8(b, 3)
+        if (atyp == 1) {
+            let ip: int = Bytes.U32(b, 4)
+            let port: int = Bytes.U16(b, 8)
+            this.Endpoint.SendTo(ip, port, b, 10, b.Count() - 10)
+            return
+        }
+        if (atyp == 3) {
+            let nlen: int = Bytes.U8(b, 4)
+            if (b.Count() < 7 + nlen) { return }
+            let name: string = Bytes.ToString(b, 5, nlen)
+            let port: int = Bytes.U16(b, 5 + nlen)
+            let dataOff: int = 7 + nlen
+            let lit: int = Addr.ParseIp(name)
+            if (lit >= 0) {
+                this.Endpoint.SendTo(lit, port, b, dataOff, b.Count() - dataOff)
+                return
+            }
+            if (this.Pending.Count() >= 32) { return }
+            let data: List<int> = Bytes.Slice(b, dataOff, b.Count() - dataOff)
+            this.Pending.Add(new UdpPendingName(DnsLookup.Start(name), port, data, now))
+        }
+        // ATYP 4 (IPv6) : la pile est IPv4 seule → ignoré.
+    }
+
+    public void Close() {
+        HostSock.Close(this.HostFd)
+        this.HostFd = -1
+        this.Endpoint.Close()
+        for i in 0..this.Pending.Count() {
+            let p: UdpPendingName = this.Pending.Get(i)
+            p.Lookup.Free()
+        }
+        this.Pending.Clear()
+    }
+}
+
+public class SocksSession {
+    public Id:     int
+    public Fd:     int
+    // 0 GREETING, 1 AUTH, 2 REQUEST, 3 RESOLVING, 4 CONNECTING, 5 RELAY, 6 UDP, 9 DONE
+    public State:  int
+    public In:     ByteQueue      // reçu de l'application, pas encore traité/relayé
+    public Out:    ByteQueue      // à envoyer à l'application
+    public Stream: TcpStream
+    public Lookup: DnsLookup
+    public Udp:    UdpAssociation
+    public Target: string         // pour les journaux
+    public DstPort: int
+    public HostEof:       bool
+    public NetShutSent:   bool    // FIN envoyé côté réseau
+    public HostShutSent:  bool    // shutdown(SHUT_WR) côté application
+    public CloseAfterFlush: bool
+    public Started: int
+    public Http:    bool          // session HTTP CONNECT (et non SOCKS5)
+    public BytesUp:   int
+    public BytesDown: int
+
+    public SocksSession(int id, int fd, int now) {
+        this.Id     = id
+        this.Fd     = fd
+        this.State  = 0
+        this.In     = new ByteQueue()
+        this.Out    = new ByteQueue()
+        this.Stream = null
+        this.Lookup = null
+        this.Udp    = null
+        this.Target = "?"
+        this.DstPort = 0
+        this.HostEof = false
+        this.NetShutSent = false
+        this.HostShutSent = false
+        this.CloseAfterFlush = false
+        this.Started = now
+        this.Http = false
+        this.BytesUp = 0
+        this.BytesDown = 0
+    }
+
+    public string Tag() {
+        return "[socks#" + String.FromInt(this.Id) + "]"
+    }
+}
+
+public class SocksServer {
+    public Config:   SocksConfig
+    public ListenFd: int
+    public Sessions: List<SocksSession>
+    public NextId:   int
+
+    public SocksServer(SocksConfig cfg) {
+        this.Config   = cfg
+        this.ListenFd = -1
+        this.Sessions = new List<SocksSession>()
+        this.NextId   = 1
+    }
+
+    public bool Start() {
+        this.ListenFd = HostSock.ListenTcp(this.Config.ListenHost, this.Config.ListenPort)
+        if (this.ListenFd < 0) {
+            Log.Error("SOCKS5 : impossible d'écouter sur " + this.Config.ListenHost + ":" + String.FromInt(this.Config.ListenPort))
+            return false
+        }
+        var auth: string = "sans authentification"
+        if (this.Config.Username != "") { auth = "authentification utilisateur/mot de passe" }
+        Log.Info("SOCKS5 + HTTP CONNECT en écoute sur " + this.Config.ListenHost + ":" + String.FromInt(this.Config.ListenPort) + " (" + auth + ")")
+        return true
+    }
+
+    public void Stop() {
+        for i in 0..this.Sessions.Count() {
+            let s: SocksSession = this.Sessions.Get(i)
+            this.Finish(s, true)
+        }
+        this.Sessions.Clear()
+        HostSock.Close(this.ListenFd)
+        this.ListenFd = -1
+    }
+
+    // Vrai s'il reste du travail immédiat (données en attente d'un côté
+    // ou de l'autre) : la boucle principale ne doit alors pas dormir.
+    public bool Busy() {
+        for i in 0..this.Sessions.Count() {
+            let s: SocksSession = this.Sessions.Get(i)
+            if (s.Out.Count() > 0) { return true }
+            if (s.State == 5) {
+                if (s.In.Count() > 0 && s.Stream.WriteRoom() > 0) { return true }
+                if (s.Stream.Readable() > 0) { return true }
+            }
+        }
+        return false
+    }
+
+    // Résumé de diagnostic : sessions par état et octets en attente.
+    public string Diag() {
+        var byState: List<int> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        var inQ: int = 0
+        var outQ: int = 0
+        var netRx: int = 0
+        var stuck: string = ""
+        for i in 0..this.Sessions.Count() {
+            let s: SocksSession = this.Sessions.Get(i)
+            byState.Set(s.State, byState.Get(s.State) + 1)
+            inQ = inQ + s.In.Count()
+            outQ = outQ + s.Out.Count()
+            if (s.State == 5) {
+                let r: int = s.Stream.Readable()
+                netRx = netRx + r
+                if ((s.In.Count() > 0 || r > 0 || s.Out.Count() > 0) && String.Length(stuck) < 300) {
+                    stuck = stuck + " #" + String.FromInt(s.Id) + "(in=" + String.FromInt(s.In.Count())
+                        + " out=" + String.FromInt(s.Out.Count()) + " rx=" + String.FromInt(r)
+                        + " room=" + String.FromInt(s.Stream.WriteRoom()) + ")"
+                }
+            }
+        }
+        return "sessions=" + String.FromInt(this.Sessions.Count())
+            + " négo=" + String.FromInt(byState.Get(0) + byState.Get(1) + byState.Get(2))
+            + " dns=" + String.FromInt(byState.Get(3)) + " connexion=" + String.FromInt(byState.Get(4))
+            + " relais=" + String.FromInt(byState.Get(5)) + " udp=" + String.FromInt(byState.Get(6))
+            + " in=" + String.FromInt(inQ) + " out=" + String.FromInt(outQ) + " rx-lwip=" + String.FromInt(netRx)
+            + stuck
+    }
+
+    // Descripteurs à surveiller pour l'attente de la boucle principale.
+    public List<int> Fds() {
+        let r = new List<int>()
+        r.Add(this.ListenFd)
+        for i in 0..this.Sessions.Count() {
+            let s: SocksSession = this.Sessions.Get(i)
+            r.Add(s.Fd)
+            if (s.Udp != null) { r.Add(s.Udp.HostFd) }
+        }
+        return r
+    }
+
+    public void Poll(int now) {
+        // Nouvelles connexions
+        var spin: int = 0
+        while (spin < 64) {
+            spin = spin + 1
+            let fd: int = HostSock.Accept(this.ListenFd)
+            if (fd < 0) { break }
+            if (this.Sessions.Count() >= this.Config.MaxSessions) {
+                HostSock.Close(fd)
+                Log.Warn("SOCKS5 : trop de sessions, connexion refusée")
+                continue
+            }
+            let s = new SocksSession(this.NextId, fd, now)
+            this.NextId = this.NextId + 1
+            this.Sessions.Add(s)
+        }
+        // Sessions
+        var i: int = 0
+        while (i < this.Sessions.Count()) {
+            let s: SocksSession = this.Sessions.Get(i)
+            this.Step(s, now)
+            if (s.State == 9) {
+                this.Sessions.RemoveAt(i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+
+    // ── Machine d'états d'une session ───────────────────
+    private void Step(SocksSession s, int now) {
+        this.ReadHost(s)
+        if (s.State == 0) { this.OnGreeting(s) }
+        if (s.State == 7) { this.OnHttpConnect(s) }
+        if (s.State == 1) { this.OnAuth(s) }
+        if (s.State == 2) { this.OnRequest(s) }
+        if (s.State == 3) { this.OnResolving(s, now) }
+        if (s.State == 4) { this.OnConnecting(s) }
+        if (s.State == 5) { this.OnRelay(s) }
+        if (s.State == 6) { this.OnUdp(s, now) }
+        // Négociation trop longue
+        if (((s.State >= 0 && s.State <= 2) || s.State == 7) && now - s.Started > 30000) {
+            Log.Info(s.Tag() + " négociation trop longue (état " + String.FromInt(s.State)
+                + ", " + String.FromInt(s.In.Count()) + " octets reçus) : fermeture")
+            if (s.Http) {
+                this.HttpReply(s, "408 Request Timeout", "en-têtes CONNECT incomplets", "")
+            } else {
+                this.Finish(s, false)
+                return
+            }
+        }
+        this.FlushHost(s)
+        if (s.CloseAfterFlush && s.Out.Count() == 0) {
+            this.Finish(s, false)
+        }
+    }
+
+    private void ReadHost(SocksSession s) {
+        if (s.HostEof || s.State == 9) { return }
+        // Contre-pression : en relais, on ne lit que ce que lwIP peut prendre.
+        var max: int = 65536 - s.In.Count()
+        if (s.State == 5) {
+            let room: int = s.Stream.WriteRoom()
+            if (room < max) { max = room }
+        }
+        if (max <= 0) { return }
+        let data: List<int> = HostSock.Recv(s.Fd, max)
+        let st: int = HostSock.LastStatus()
+        if (data.Count() > 0) { s.In.Append(data) }
+        if (st == 1) {
+            s.HostEof = true
+            if (s.State <= 4 || s.State == 7) {
+                Log.Info(s.Tag() + " le client a fermé avant la réponse (état " + String.FromInt(s.State)
+                    + ", cible " + s.Target + ")")
+            }
+        }
+        if (st == 2) {
+            Log.Debug(s.Tag() + " connexion applicative interrompue (état " + String.FromInt(s.State) + ")")
+            s.HostEof = true
+            if (s.Stream != null) { s.Stream.Abort() }
+            this.Finish(s, false)
+        }
+    }
+
+    private void FlushHost(SocksSession s) {
+        if (s.State == 9) { return }
+        var spin: int = 0
+        while (s.Out.Count() > 0 && spin < 16) {
+            spin = spin + 1
+            var n: int = s.Out.Count()
+            if (n > 65536) { n = 65536 }
+            let sent: int = HostSock.Send(s.Fd, s.Out.Data, s.Out.Head, n)
+            if (sent < 0) {
+                if (s.Stream != null) { s.Stream.Abort() }
+                this.Finish(s, false)
+                return
+            }
+            if (sent == 0) { return }
+            s.Out.Drop(sent)
+        }
+    }
+
+    // VER NMETHODS METHODS…
+    private void OnGreeting(SocksSession s) {
+        if (s.In.Count() >= 1 && s.In.Get(0) != 5) {
+            // Pas SOCKS5 : on tente HTTP (lettre majuscule = méthode HTTP).
+            let c: int = s.In.Get(0)
+            if (c >= 0x41 && c <= 0x5A) {
+                s.Http = true
+                s.State = 7
+                return
+            }
+        }
+        if (s.In.Count() < 2) { return }
+        if (s.In.Get(0) != 5) {
+            Log.Info(s.Tag() + " protocole inconnu (premier octet 0x" + Bytes.Hex(s.In.Peek(0, 1), 0, 1)
+                + ") : ni SOCKS5 ni HTTP CONNECT. Proxy configuré en https:// au lieu de http:// ?")
+            this.Finish(s, false)
+            return
+        }
+        let nm: int = s.In.Get(1)
+        if (s.In.Count() < 2 + nm) { return }
+        var hasNone: bool = false
+        var hasUserPass: bool = false
+        for i in 0..nm {
+            let m: int = s.In.Get(2 + i)
+            if (m == 0) { hasNone = true }
+            if (m == 2) { hasUserPass = true }
+        }
+        s.In.Drop(2 + nm)
+        if (this.Config.Username != "") {
+            if (hasUserPass) {
+                s.Out.Append([5, 2])
+                s.State = 1
+                return
+            }
+        } else if (hasNone) {
+            s.Out.Append([5, 0])
+            s.State = 2
+            return
+        }
+        s.Out.Append([5, 0xFF])
+        s.CloseAfterFlush = true
+        s.State = 8
+    }
+
+    // RFC 1929 : VER ULEN UNAME PLEN PASSWD
+    private void OnAuth(SocksSession s) {
+        if (s.In.Count() < 2) { return }
+        let ulen: int = s.In.Get(1)
+        if (s.In.Count() < 3 + ulen) { return }
+        let plen: int = s.In.Get(2 + ulen)
+        if (s.In.Count() < 3 + ulen + plen) { return }
+        let all: List<int> = s.In.Peek(0, 3 + ulen + plen)
+        let user: string = Bytes.ToString(all, 2, ulen)
+        let pass: string = Bytes.ToString(all, 3 + ulen, plen)
+        s.In.Drop(3 + ulen + plen)
+        if (all.Get(0) == 1 && user == this.Config.Username && pass == this.Config.Password) {
+            s.Out.Append([1, 0])
+            s.State = 2
+            return
+        }
+        Log.Warn(s.Tag() + " authentification refusée")
+        s.Out.Append([1, 1])
+        s.CloseAfterFlush = true
+        s.State = 8
+    }
+
+    // VER CMD RSV ATYP DST.ADDR DST.PORT
+    private void OnRequest(SocksSession s) {
+        if (s.In.Count() < 5) { return }
+        let ver: int = s.In.Get(0)
+        let cmd: int = s.In.Get(1)
+        let atyp: int = s.In.Get(3)
+        var alen: int = 0
+        if (atyp == 1) { alen = 4 }
+        if (atyp == 3) { alen = 1 + s.In.Get(4) }
+        if (atyp == 4) { alen = 16 }
+        if (ver != 5 || alen == 0) {
+            this.Reply(s, 8)
+            return
+        }
+        let total: int = 4 + alen + 2
+        if (s.In.Count() < total) { return }
+        let req: List<int> = s.In.Peek(0, total)
+        s.In.Drop(total)
+        s.DstPort = Bytes.U16(req, 4 + alen)
+
+        if (atyp == 4) {
+            this.Reply(s, 8)          // IPv6 : non pris en charge par la pile
+            return
+        }
+        if (cmd == 3) {
+            this.StartUdp(s)
+            return
+        }
+        if (cmd != 1) {
+            this.Reply(s, 7)          // BIND et autres : non supportés
+            return
+        }
+        if (atyp == 1) {
+            let ip: int = Bytes.U32(req, 4)
+            s.Target = Addr.Ip(ip) + ":" + String.FromInt(s.DstPort)
+            this.StartConnect(s, ip)
+            return
+        }
+        let name: string = Bytes.ToString(req, 5, req.Get(4))
+        s.Target = name + ":" + String.FromInt(s.DstPort)
+        let lit: int = Addr.ParseIp(name)
+        if (lit >= 0) {
+            this.StartConnect(s, lit)
+            return
+        }
+        if (Net.Ip() == 0) {
+            this.Reply(s, 3)
+            return
+        }
+        s.Lookup = DnsLookup.Start(name)
+        s.Started = Clock.NowMs()
+        s.State = 3
+    }
+
+    private void OnResolving(SocksSession s, int now) {
+        let st: int = s.Lookup.Status()
+        if (st == 0 && now - s.Started < 15000) { return }
+        if (st == 1) {
+            let ip: int = s.Lookup.Address()
+            s.Lookup.Free()
+            s.Lookup = null
+            this.StartConnect(s, ip)
+            return
+        }
+        Log.Info(s.Tag() + " résolution DNS échouée : " + s.Target)
+        s.Lookup.Free()
+        s.Lookup = null
+        this.Reply(s, 4)
+    }
+
+    private void StartConnect(SocksSession s, int ip) {
+        if (Net.Ip() == 0) {
+            Log.Warn(s.Tag() + " pas encore d'adresse IP sur l'interface (DHCP en cours ?)")
+            this.Reply(s, 3)
+            return
+        }
+        s.Stream = TcpStream.Connect(ip, s.DstPort)
+        if (s.Stream == null) {
+            this.Reply(s, 1)
+            return
+        }
+        s.State = 4
+    }
+
+    private void OnConnecting(SocksSession s) {
+        if (s.Stream.IsConnecting()) { return }
+        if (s.Stream.IsOpen()) {
+            Log.Debug(s.Tag() + " connecté à " + s.Target)
+            this.ReplyOk(s, Net.Ip(), s.Stream.LocalPort())
+            s.State = 5
+            return
+        }
+        let err: string = s.Stream.Error()
+        Log.Info(s.Tag() + " connexion à " + s.Target + " échouée (" + err + ")")
+        var rep: int = 1
+        if (err == "refused") { rep = 5 }
+        if (err == "timeout") { rep = 4 }
+        this.Reply(s, rep)
+    }
+
+    private void OnRelay(SocksSession s) {
+        let st: TcpStream = s.Stream
+        // Application → réseau
+        if (s.In.Count() > 0) {
+            var n: int = s.In.Count()
+            if (n > 65536) { n = 65536 }
+            let w: int = st.Write(s.In.Data, s.In.Head, n)
+            if (w > 0) {
+                s.In.Drop(w)
+                s.BytesUp = s.BytesUp + w
+            }
+        }
+        if (s.HostEof && s.In.Count() == 0 && !s.NetShutSent) {
+            st.ShutdownWrite()
+            s.NetShutSent = true
+        }
+        // Réseau → application
+        if (s.Out.Count() < 262144 && st.Readable() > 0) {
+            let d: List<int> = st.Read(65536)
+            s.Out.Append(d)
+            s.BytesDown = s.BytesDown + d.Count()
+        }
+        if (st.AtEof() && s.Out.Count() == 0 && !s.HostShutSent) {
+            HostSock.ShutdownWrite(s.Fd)
+            s.HostShutSent = true
+        }
+        // Fin : les deux sens sont clos, ou la connexion réseau a sauté.
+        let netErr: string = st.Error()
+        if (st.IsClosed() && netErr != "" && s.Out.Count() == 0) {
+            Log.Debug(s.Tag() + " " + s.Target + " fermé par le réseau (" + netErr + ")")
+            this.Finish(s, false)
+            return
+        }
+        if (s.HostShutSent && s.NetShutSent) {
+            this.Finish(s, false)
+        }
+    }
+
+    private void StartUdp(SocksSession s) {
+        if (Net.Ip() == 0) {
+            this.Reply(s, 3)
+            return
+        }
+        let ep: UdpEndpoint = UdpEndpoint.Open()
+        if (ep == null) {
+            this.Reply(s, 1)
+            return
+        }
+        let hfd: int = HostSock.UdpBind(this.Config.ListenHost, 0)
+        if (hfd < 0) {
+            ep.Close()
+            this.Reply(s, 1)
+            return
+        }
+        s.Udp = new UdpAssociation(hfd, ep)
+        s.Target = "udp-associate"
+        var bnd: int = Addr.ParseIp(this.Config.ListenHost)
+        if (bnd <= 0) { bnd = 0x7F000001 }
+        this.ReplyOk(s, bnd, HostSock.LocalPort(hfd))
+        s.State = 6
+        Log.Debug(s.Tag() + " UDP ASSOCIATE sur le port local " + String.FromInt(HostSock.LocalPort(hfd)))
+    }
+
+    private void OnUdp(SocksSession s, int now) {
+        s.In.Clear()          // la connexion de contrôle ne porte rien d'autre
+        s.Udp.Pump(now)
+        if (s.HostEof) { this.Finish(s, false) }
+    }
+
+    // ── HTTP CONNECT ────────────────────────────────────
+    //   CONNECT hôte:port HTTP/1.1
+    //   Host: hôte:port
+    //   [Proxy-Authorization: Basic …]
+    //
+    private void OnHttpConnect(SocksSession s) {
+        var n: int = s.In.Count()
+        if (n > 16384) { n = 16384 }
+        let head: string = Bytes.ToString(s.In.Peek(0, n), 0, n)
+        let end: int = String.IndexOf(head, "\r\n\r\n")
+        if (end < 0) {
+            if (s.In.Count() >= 16384) { this.HttpReply(s, "431 Request Header Fields Too Large", "en-têtes trop longs", "") }
+            return
+        }
+        s.In.Drop(end + 4)          // ce qui suit (rare) sera relayé tel quel
+        let lineEnd: int = String.IndexOf(head, "\r\n")
+        let parts: List<string> = String.Split(String.Until(head, lineEnd), " ")
+        if (parts.Count() != 3 || !String.StartsWith(parts.Get(2), "HTTP/1.")) {
+            this.HttpReply(s, "400 Bad Request", "requête invalide", "")
+            return
+        }
+        if (parts.Get(0) != "CONNECT") {
+            // Proxy de tunnel uniquement : pas de GET http://… en clair.
+            this.HttpReply(s, "405 Method Not Allowed", "seule la méthode CONNECT est acceptée", "Allow: CONNECT\r\n")
+            return
+        }
+        if (this.Config.Username != "" && !this.HttpAuthorized(head)) {
+            Log.Warn(s.Tag() + " HTTP CONNECT : authentification refusée")
+            this.HttpReply(s, "407 Proxy Authentication Required", "authentification requise",
+                "Proxy-Authenticate: Basic realm=\"amalgame-bridge\"\r\n")
+            return
+        }
+        let target: string = parts.Get(1)
+        Log.Debug(s.Tag() + " HTTP CONNECT " + target)
+        if (String.StartsWith(target, "[")) {
+            this.HttpReply(s, "502 Bad Gateway", "IPv6 non pris en charge par la pile", "")
+            return
+        }
+        let colon: int = String.LastIndexOf(target, ":")
+        var host: string = target
+        var port: int = 443
+        if (colon > 0) {
+            host = String.Until(target, colon)
+            port = String.ToInt(String.From(target, colon + 1))
+        }
+        if (port <= 0 || port > 65535 || String.Length(host) == 0) {
+            this.HttpReply(s, "400 Bad Request", "cible CONNECT invalide", "")
+            return
+        }
+        s.DstPort = port
+        s.Target = host + ":" + String.FromInt(port)
+        let lit: int = Addr.ParseIp(host)
+        if (lit >= 0) {
+            this.StartConnect(s, lit)
+            return
+        }
+        if (Net.Ip() == 0) {
+            this.Reply(s, 3)
+            return
+        }
+        s.Lookup = DnsLookup.Start(host)
+        s.Started = Clock.NowMs()
+        s.State = 3
+    }
+
+    // Vérifie « Proxy-Authorization: Basic base64(user:pass) ».
+    private bool HttpAuthorized(string head) {
+        let lower: string = String.ToLower(head)
+        let k: int = String.IndexOf(lower, "\r\nproxy-authorization:")
+        if (k < 0) { return false }
+        let rest: string = String.From(head, k + 22)
+        var stop: int = String.IndexOf(rest, "\r\n")
+        if (stop < 0) { stop = String.Length(rest) }
+        let value: string = String.Trim(String.Until(rest, stop))
+        let expected: string = "Basic " + Bytes.Base64(this.Config.Username + ":" + this.Config.Password)
+        return value == expected
+    }
+
+    private void HttpReply(SocksSession s, string status, string body, string extra) {
+        let text: string = "HTTP/1.1 " + status + "\r\n" + extra
+            + "Content-Type: text/plain; charset=utf-8\r\nContent-Length: " + String.FromInt(String.Length(body) + 1)
+            + "\r\nConnection: close\r\n\r\n" + body + "\n"
+        s.Out.Append(Bytes.FromString(text))
+        s.CloseAfterFlush = true
+        s.State = 8
+        if (s.Stream != null) {
+            s.Stream.Release()
+            s.Stream = null
+        }
+    }
+
+    // ── Réponses ────────────────────────────────────────
+    private void ReplyOk(SocksSession s, int ip, int port) {
+        if (s.Http) {
+            s.Out.Append(Bytes.FromString("HTTP/1.1 200 Connection established\r\n\r\n"))
+            return
+        }
+        let r = new List<int>()
+        Bytes.Put8(r, 5)
+        Bytes.Put8(r, 0)
+        Bytes.Put8(r, 0)
+        Bytes.Put8(r, 1)
+        Bytes.Put32(r, ip)
+        Bytes.Put16(r, port)
+        s.Out.Append(r)
+    }
+
+    // Réponse d'échec puis fermeture (codes RFC 1928 §6).
+    private void Reply(SocksSession s, int rep) {
+        if (s.Http) {
+            if (rep == 3) {
+                this.HttpReply(s, "503 Service Unavailable", "pas encore d'adresse IP sur l'interface (DHCP en cours ?)", "")
+            } else if (rep == 4) {
+                this.HttpReply(s, "504 Gateway Timeout", "hôte injoignable ou DNS en échec : " + s.Target, "")
+            } else if (rep == 5) {
+                this.HttpReply(s, "502 Bad Gateway", "connexion refusée par " + s.Target, "")
+            } else {
+                this.HttpReply(s, "502 Bad Gateway", "échec de connexion vers " + s.Target, "")
+            }
+            return
+        }
+        s.Out.Append([5, rep, 0, 1, 0, 0, 0, 0, 0, 0])
+        s.CloseAfterFlush = true
+        s.State = 8
+        if (s.Stream != null) {
+            s.Stream.Release()
+            s.Stream = null
+        }
+    }
+
+    private void Finish(SocksSession s, bool shuttingDown) {
+        if (s.State == 9) { return }
+        if (s.State == 5 || s.State == 6) {
+            Log.Debug(s.Tag() + " fin " + s.Target + " ↑" + String.FromInt(s.BytesUp) + " ↓" + String.FromInt(s.BytesDown))
+        }
+        if (s.Stream != null) {
+            s.Stream.Release()
+            s.Stream = null
+        }
+        if (s.Lookup != null) {
+            s.Lookup.Free()
+            s.Lookup = null
+        }
+        if (s.Udp != null) {
+            s.Udp.Close()
+            s.Udp = null
+        }
+        HostSock.Close(s.Fd)
+        s.Fd = -1
+        s.State = 9
+    }
+}

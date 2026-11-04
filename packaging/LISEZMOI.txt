@@ -1,0 +1,131 @@
+UNDER THE BRIDGE
+================
+
+Under The Bridge est un proxy local pour Windows. Les applications qui
+l'utilisent sortent sur Internet par la carte reseau de votre choix
+(Wi-Fi ou Ethernet), quelle que soit la route par defaut de Windows.
+
+  Adresse du proxy : 127.0.0.1, port 1080
+    - en SOCKS5      : socks5://127.0.0.1:1080
+    - en HTTP        : http://127.0.0.1:1080
+
+Le proxy n'est accessible que depuis votre PC.
+
+
+1. PREREQUIS
+------------
+
+Installez Npcap : https://npcap.com
+Pendant son installation, laissez DECOCHEE l'option
+"Install Npcap in WinPcap API-compatible Mode".
+
+
+2. INSTALLATION
+---------------
+
+1. Decompressez le zip dans un dossier.
+2. Double-cliquez sur install.cmd et acceptez la demande d'administrateur.
+3. La liste de vos cartes reseau s'affiche. Appuyez simplement sur
+   Entree : le service prendra automatiquement la carte qui vous sert
+   a aller sur Internet (Ethernet ou Wi-Fi), a chaque demarrage.
+   Pour imposer une carte precise, tapez son nom tel qu'il apparait
+   dans la premiere colonne (exemples : Wi-Fi, Ethernet, Ethernet 2).
+
+Le service "Under The Bridge" est alors installe. Il demarre
+automatiquement avec Windows.
+
+Pour mettre a jour : decompressez la nouvelle version et relancez
+install.cmd. Votre configuration est conservee.
+
+
+3. CONFIGURER VOS APPLICATIONS
+------------------------------
+
+Navigateur Chrome
+  Utilisez chrome-bridge.cmd. Il est copie dans
+  C:\Program Files\UnderTheBridge : vous pouvez creer un raccourci
+  vers ce fichier sur le Bureau.
+  Il ouvre un Chrome separe (profil distinct de votre Chrome habituel),
+  dont tout le trafic passe par le proxy.
+
+Firefox
+  Parametres > Parametres reseau > Configuration manuelle du proxy :
+  Hote SOCKS 127.0.0.1, port 1080, SOCKS v5.
+  Cochez "Utiliser un DNS distant lorsque SOCKS v5 est actif".
+
+Claude Code (terminal ou VS Code)
+  Ajoutez ceci dans %USERPROFILE%\.claude\settings.json :
+
+    {
+      "env": {
+        "HTTPS_PROXY": "http://127.0.0.1:1080",
+        "NO_PROXY": "localhost,127.0.0.1"
+      }
+    }
+
+  Puis fermez et rouvrez VS Code (ou le terminal).
+
+curl
+  curl.exe -x http://127.0.0.1:1080 https://example.com
+
+Autres programmes
+  Ceux qui acceptent un proxy SOCKS5 ou la variable HTTPS_PROXY.
+
+
+4. VERIFIER QUE CA MARCHE
+-------------------------
+
+Dans PowerShell :
+
+  curl.exe -x http://127.0.0.1:1080 https://example.com
+
+Si le service fonctionne, la commande affiche une page HTML.
+
+
+5. EN CAS DE PROBLEME
+---------------------
+
+Journal du service :
+  C:\ProgramData\UnderTheBridge\bridge.log
+
+Configuration (a modifier dans le Bloc-notes lance en administrateur) :
+  C:\Program Files\UnderTheBridge\bridge.conf
+  Apres chaque modification, redemarrez le service. Dans PowerShell
+  administrateur :
+    Restart-Service UnderTheBridge
+
+Messages frequents :
+  - "503 ... pas encore d'adresse IP"
+      Le service attend une adresse du reseau (DHCP). Patientez quelques
+      secondes. Si ca dure, verifiez que la carte choisie est bien
+      connectee.
+  - "BACKING_OFF" dans le journal (surtout en Wi-Fi)
+      Le routeur refuse de donner une deuxieme adresse a la carte.
+      Dans bridge.conf, passez en adresse fixe : mode = static, puis
+      ip, mask et gateway, avec une adresse libre hors de la plage
+      DHCP du routeur.
+  - Le navigateur affiche DNS_PROBE_FINISHED_NXDOMAIN sur une adresse
+    http://localhost:...
+      Utilisez la derniere version de chrome-bridge.cmd.
+
+Changement de carte reseau (passage du Wi-Fi a l'Ethernet...) :
+  avec "interface = auto", la carte est choisie au demarrage du
+  service. Redemarrez-le : Restart-Service UnderTheBridge
+
+Pour plus de details dans le journal : mettez log_level = debug dans
+bridge.conf, puis redemarrez le service.
+
+
+6. DESINSTALLATION
+------------------
+
+Double-cliquez sur uninstall.cmd. Le service est supprime ; vos
+fichiers restent dans C:\Program Files\UnderTheBridge et
+C:\ProgramData\UnderTheBridge, vous pouvez supprimer ces dossiers.
+
+
+7. LICENCES
+-----------
+
+Le dossier licenses\ contient les licences des composants inclus :
+lwIP (BSD), amalgame-service (Apache 2.0), bdwgc et winpthreads.

@@ -1,0 +1,54 @@
+# bridge.conf — configuration d'amalgame-bridge
+# Copier en bridge.conf à côté de bridge.exe. Format : clé = valeur.
+
+# ── Interface désignée ──────────────────────────────────────────
+#   auto  (défaut) la carte Ethernet ou Wi-Fi active qui porte la route
+#         par défaut (celle que Windows utilise pour Internet). Choisie
+#         au démarrage du service.
+#   Sinon un nom. Windows : nom convivial (« Ethernet 2 »), GUID {…},
+#   description de la carte, ou \Device\NPF_{GUID}. Linux : nom noyau (enp0s3).
+# `bridge --list-interfaces` affiche les valeurs possibles et le choix « auto ».
+interface = auto
+
+# MAC utilisée par la pile :
+#   auto  MAC administrée localement dérivée de la carte (défaut) : le
+#         réseau voit un hôte distinct, avec son propre bail DHCP.
+#         Nécessite la promiscuité (activée automatiquement).
+#   host  MAC de la carte : obligatoire en Wi-Fi (un point d'accès
+#         n'accepte qu'une MAC par station). Le bail DHCP reste distinct
+#         grâce à l'identifiant client. Avec mac = auto sur une carte
+#         Wi-Fi, ce mode est choisi automatiquement.
+#   aa:bb:cc:dd:ee:ff  MAC explicite.
+mac = auto
+
+# ── Adressage ───────────────────────────────────────────────────
+mode = dhcp
+hostname = amalgame-bridge
+# Identifiant client DHCP (option 61) :
+#   auto  (défaut) avec mac = host : « bridge-<mac> », pour que le serveur
+#         DHCP attribue à la pile un bail DISTINCT de celui de Windows ;
+#         avec une MAC propre : 01 + MAC (forme standard).
+#   none  pas d'option 61.  Tout autre texte : identifiant libre.
+# Si le routeur ignore l'option 61 (bail lié à la MAC), utiliser mode = static.
+dhcp_client_id = auto
+# mode = static
+# ip = 192.168.1.250
+# mask = 255.255.255.0
+# gateway = 192.168.1.1
+
+# DNS imposés (sinon ceux du DHCP). Deux au maximum.
+# dns = 1.1.1.1, 9.9.9.9
+
+mtu = 1500
+
+# ── Point de montage SOCKS5 ─────────────────────────────────────
+socks_listen = 127.0.0.1:1080
+# Authentification RFC 1929 (obligatoire si l'écoute n'est pas 127.0.0.1).
+# socks_user = bridge
+# socks_password = changeme
+socks_max_sessions = 512
+
+# ── Journal ─────────────────────────────────────────────────────
+log_level = info
+# log_file = C:\ProgramData\UnderTheBridge\bridge.log
+service_name = UnderTheBridge

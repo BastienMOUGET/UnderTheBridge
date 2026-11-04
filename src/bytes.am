@@ -1,0 +1,331 @@
+namespace Amalgame.Bridge
+
+// ── Octets ────────────────────────────────────────────────────────
+//
+// Les trames circulent en `List<int>` (un octet 0..255 par entrée),
+// comme le reste de l'écosystème Amalgame (Compress, MsgPack, …).
+// Les boucles chaudes (checksum, copie de tranches) sont en C : elles
+// lisent directement `AmalgameList.data`.
+
+@c {
+    #include <stdint.h>
+    #include <string.h>
+
+    #define BR_B(l, i) ((uint32_t)((intptr_t)((l)->data[(i)]) & 0xff))
+
+    /* Somme Internet (RFC 1071) sur une tranche de liste, sans repli
+     * final : permet d'enchaîner pseudo-en-tête + segment. */
+    static uint32_t br_sum_list(AmalgameList* l, int off, int len, uint32_t acc) {
+        int end = off + len;
+        if (!l || off < 0 || end > l->size) return acc;
+        int i = off;
+        for (; i + 1 < end; i += 2) acc += (BR_B(l, i) << 8) | BR_B(l, i + 1);
+        if (i < end) acc += BR_B(l, i) << 8;
+        return acc;
+    }
+
+    static uint16_t br_fold(uint32_t acc) {
+        while (acc >> 16) acc = (acc & 0xffff) + (acc >> 16);
+        return (uint16_t)(~acc & 0xffff);
+    }
+}
+
+public class Bytes {
+    public Bytes() {}
+
+    // ── Lecture big-endian ──────────────────────────────
+    public static int U8(List<int> b, int off) {
+        @c {
+            if (!b || off < 0 || off >= b->size) return 0;
+            return (i64) BR_B(b, (int) off);
+        }
+    }
+
+    public static int U16(List<int> b, int off) {
+        @c {
+            if (!b || off < 0 || off + 2 > b->size) return 0;
+            return (i64) ((BR_B(b, (int) off) << 8) | BR_B(b, (int) off + 1));
+        }
+    }
+
+    public static int U32(List<int> b, int off) {
+        @c {
+            if (!b || off < 0 || off + 4 > b->size) return 0;
+            int o = (int) off;
+            return (i64) (((uint64_t) BR_B(b, o) << 24) | (BR_B(b, o + 1) << 16)
+                        | (BR_B(b, o + 2) << 8) | BR_B(b, o + 3));
+        }
+    }
+
+    // ── Écriture big-endian (en fin de liste) ───────────
+    public static void Put8(List<int> b, int v) {
+        b.Add(v & 0xff)
+    }
+
+    public static void Put16(List<int> b, int v) {
+        b.Add((v >> 8) & 0xff)
+        b.Add(v & 0xff)
+    }
+
+    public static void Put32(List<int> b, int v) {
+        b.Add((v >> 24) & 0xff)
+        b.Add((v >> 16) & 0xff)
+        b.Add((v >> 8) & 0xff)
+        b.Add(v & 0xff)
+    }
+
+    public static void PutZeros(List<int> b, int n) {
+        for i in 0..n { b.Add(0) }
+    }
+
+    // ── Écriture big-endian (en place) ──────────────────
+    public static void Set16(List<int> b, int off, int v) {
+        b.Set(off, (v >> 8) & 0xff)
+        b.Set(off + 1, v & 0xff)
+    }
+
+    // ── Tranches ────────────────────────────────────────
+    // Copie [off, off+len) dans une nouvelle liste (bornée).
+    public static List<int> Slice(List<int> b, int off, int len) {
+        @c {
+            AmalgameList* r = AmalgameList_newWithCapacity(len > 0 ? (int) len : 8);
+            if (!b || off < 0 || len <= 0) return r;
+            int end = (int) (off + len);
+            if (end > b->size) end = b->size;
+            int n = end - (int) off;
+            if (n <= 0) return r;
+            memcpy(r->data, b->data + off, sizeof(void*) * n);
+            r->size = n;
+            return r;
+        }
+    }
+
+    // Ajoute src[off, off+len) à la fin de dst.
+    public static void AppendRange(List<int> dst, List<int> src, int off, int len) {
+        @c {
+            if (!dst || !src || off < 0 || len <= 0) return;
+            int end = (int) (off + len);
+            if (end > src->size) end = src->size;
+            int n = end - (int) off;
+            if (n <= 0) return;
+            if (dst->size + n > dst->capacity) {
+                int cap = dst->capacity * 2;
+                if (cap < dst->size + n) cap = dst->size + n;
+                AmalgameList_reserve(dst, cap);
+            }
+            memcpy(dst->data + dst->size, src->data + off, sizeof(void*) * n);
+            dst->size += n;
+        }
+    }
+
+    public static void Append(List<int> dst, List<int> src) {
+        Bytes.AppendRange(dst, src, 0, src.Count())
+    }
+
+    // ── Checksum Internet ───────────────────────────────
+    // Somme partielle non repliée — à chaîner puis passer à Fold().
+    public static int Sum(List<int> b, int off, int len, int acc) {
+        @c { return (i64) br_sum_list(b, (int) off, (int) len, (uint32_t) acc); }
+    }
+
+    public static int Fold(int acc) {
+        @c { return (i64) br_fold((uint32_t) acc); }
+    }
+
+    public static int Checksum(List<int> b, int off, int len) {
+        return Bytes.Fold(Bytes.Sum(b, off, len, 0))
+    }
+
+    // ── Chaînes ─────────────────────────────────────────
+    public static List<int> FromString(string s) {
+        @c {
+            int n = s ? (int) strlen(s) : 0;
+            AmalgameList* r = AmalgameList_newWithCapacity(n);
+            for (int i = 0; i < n; i++) r->data[i] = (void*)(intptr_t)(unsigned char) s[i];
+            r->size = n;
+            return r;
+        }
+    }
+
+    public static string ToString(List<int> b, int off, int len) {
+        @c {
+            if (!b || off < 0 || len <= 0 || off + len > b->size) return "";
+            char* s = (char*) GC_MALLOC_ATOMIC((size_t) len + 1);
+            for (int i = 0; i < (int) len; i++) {
+                char c = (char) BR_B(b, (int) off + i);
+                s[i] = c ? c : '?';
+            }
+            s[len] = 0;
+            return s;
+        }
+    }
+
+    // Base64 standard (RFC 4648) d'une chaîne — en-têtes HTTP Basic.
+    public static string Base64(string s) {
+        @c {
+            static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            size_t n = s ? strlen(s) : 0;
+            char* o = (char*) GC_MALLOC_ATOMIC(((n + 2) / 3) * 4 + 1);
+            size_t j = 0;
+            for (size_t i = 0; i < n; i += 3) {
+                uint32_t v = (uint32_t)(unsigned char) s[i] << 16;
+                if (i + 1 < n) v |= (uint32_t)(unsigned char) s[i + 1] << 8;
+                if (i + 2 < n) v |= (uint32_t)(unsigned char) s[i + 2];
+                o[j++] = T[(v >> 18) & 63];
+                o[j++] = T[(v >> 12) & 63];
+                o[j++] = i + 1 < n ? T[(v >> 6) & 63] : '=';
+                o[j++] = i + 2 < n ? T[v & 63] : '=';
+            }
+            o[j] = 0;
+            return o;
+        }
+    }
+
+    public static string Hex(List<int> b, int off, int len) {
+        @c {
+            static const char* H = "0123456789abcdef";
+            if (!b || off < 0 || len <= 0 || off + len > b->size) return "";
+            char* s = (char*) GC_MALLOC_ATOMIC((size_t) len * 2 + 1);
+            for (int i = 0; i < (int) len; i++) {
+                uint32_t v = BR_B(b, (int) off + i);
+                s[2 * i] = H[v >> 4];
+                s[2 * i + 1] = H[v & 15];
+            }
+            s[len * 2] = 0;
+            return s;
+        }
+    }
+}
+
+// ── Adresses ──────────────────────────────────────────────────────
+// IPv4 en `int` hôte (0xC0A80001 = 192.168.0.1), MAC en `List<int>`.
+public class Addr {
+    public Addr() {}
+
+    public static string Ip(int ip) {
+        return String.FromInt((ip >> 24) & 0xff) + "." + String.FromInt((ip >> 16) & 0xff)
+            + "." + String.FromInt((ip >> 8) & 0xff) + "." + String.FromInt(ip & 0xff)
+    }
+
+    // -1 si la chaîne n'est pas un IPv4 décimal pointé valide.
+    public static int ParseIp(string s) {
+        @c {
+            if (!s) return -1;
+            uint64_t v = 0; int parts = 0; int digits = 0; uint32_t cur = 0;
+            for (const char* p = s; ; p++) {
+                if (*p >= '0' && *p <= '9') {
+                    cur = cur * 10 + (uint32_t)(*p - '0');
+                    if (++digits > 3 || cur > 255) return -1;
+                } else if (*p == '.' || *p == 0) {
+                    if (digits == 0) return -1;
+                    v = (v << 8) | cur; parts++; cur = 0; digits = 0;
+                    if (*p == 0) break;
+                    if (parts >= 4) return -1;
+                } else {
+                    return -1;
+                }
+            }
+            return parts == 4 ? (i64) v : -1;
+        }
+    }
+
+    public static string Mac(List<int> m) {
+        @c {
+            static const char* H = "0123456789abcdef";
+            if (!m || m->size < 6) return "??:??:??:??:??:??";
+            char* s = (char*) GC_MALLOC_ATOMIC(18);
+            for (int i = 0; i < 6; i++) {
+                uint32_t v = BR_B(m, i);
+                s[3 * i] = H[v >> 4]; s[3 * i + 1] = H[v & 15];
+                s[3 * i + 2] = i < 5 ? ':' : 0;
+            }
+            return s;
+        }
+    }
+
+    // Liste vide si invalide. Accepte ':' ou '-' comme séparateur.
+    public static List<int> ParseMac(string s) {
+        let r = new List<int>()
+        @c {
+            if (!s || strlen(s) != 17) return r;
+            for (int i = 0; i < 6; i++) {
+                int v = 0;
+                for (int k = 0; k < 2; k++) {
+                    char c = s[3 * i + k]; int d;
+                    if (c >= '0' && c <= '9') d = c - '0';
+                    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                    else { r->size = 0; return r; }
+                    v = v * 16 + d;
+                }
+                AmalgameList_add(r, (void*)(intptr_t) v);
+                if (i < 5 && s[3 * i + 2] != ':' && s[3 * i + 2] != '-') { r->size = 0; return r; }
+            }
+        }
+        return r
+    }
+
+    public static List<int> Broadcast() {
+        return [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+    }
+
+    public static bool SameMac(List<int> a, int aOff, List<int> b) {
+        for i in 0..6 {
+            if (Bytes.U8(a, aOff + i) != Bytes.U8(b, i)) { return false }
+        }
+        return true
+    }
+}
+
+// ── ByteQueue ─────────────────────────────────────────────────────
+// File FIFO d'octets avec tête glissante : Drop(n) est O(1) amorti
+// (compaction quand la partie consommée dépasse la moitié).
+public class ByteQueue {
+    public Data: List<int>
+    public Head: int
+
+    public ByteQueue() {
+        this.Data = new List<int>()
+        this.Head = 0
+    }
+
+    public int Count() {
+        return this.Data.Count() - this.Head
+    }
+
+    public int Get(int i) {
+        return Bytes.U8(this.Data, this.Head + i)
+    }
+
+    public void Append(List<int> b) {
+        Bytes.Append(this.Data, b)
+    }
+
+    public void AppendRange(List<int> b, int off, int len) {
+        Bytes.AppendRange(this.Data, b, off, len)
+    }
+
+    // Copie [off, off+len) relatif à la tête, sans consommer.
+    public List<int> Peek(int off, int len) {
+        return Bytes.Slice(this.Data, this.Head + off, len)
+    }
+
+    public void Drop(int n) {
+        var k: int = n
+        if (k > this.Count()) { k = this.Count() }
+        if (k <= 0) { return }
+        this.Head = this.Head + k
+        if (this.Head == this.Data.Count()) {
+            this.Data = new List<int>()
+            this.Head = 0
+        } else if (this.Head > 4096 && this.Head * 2 > this.Data.Count()) {
+            this.Data = Bytes.Slice(this.Data, this.Head, this.Data.Count() - this.Head)
+            this.Head = 0
+        }
+    }
+
+    public void Clear() {
+        this.Data = new List<int>()
+        this.Head = 0
+    }
+}

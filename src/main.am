@@ -1,0 +1,254 @@
+namespace Amalgame.Bridge
+
+import Amalgame.Service
+
+// ── amalgame-bridge — service proxy ───────────────────────────────
+//
+//   applications ──SOCKS5 127.0.0.1:1080──► bridge ──lwIP──► Npcap ──► interface désignée
+//
+// Usage :
+//   bridge [--config <fichier>]      service / console (défaut : bridge.conf
+//                                    à côté de l'exécutable)
+//   bridge --list-interfaces         interfaces utilisables
+//   bridge --selftest [--port N]     pile sur lien factice, IP 10.255.0.1,
+//                                    serveur echo TCP :7 — test bout en bout
+//                                    du SOCKS sans réseau ni privilège
+//   bridge --check-config [...]      valide la configuration et quitte
+
+public class Program {
+    public static int Main(List<string> args) {
+        let rc: int = Program.Entry(args)
+        @c { Exit_Set(rc); }
+        return rc
+    }
+
+    private static int Entry(List<string> args) {
+        Sys.InitConsole()
+        var configPath: string = Sys.ExeDir() + Sys.PathSep() + "bridge.conf"
+        var listOnly: bool = false
+        var selftest: bool = false
+        var checkOnly: bool = false
+        var portOverride: int = 0
+        var ifaceOverride: string = ""
+        var i: int = 0
+        while (i < args.Count()) {
+            let a: string = args.Get(i)
+            if (a == "--list-interfaces") { listOnly = true }
+            if (a == "--selftest") { selftest = true }
+            if (a == "--check-config") { checkOnly = true }
+            if ((a == "--config" || a == "-c") && i + 1 < args.Count()) {
+                configPath = args.Get(i + 1)
+                i = i + 1
+            }
+            if (a == "--interface" && i + 1 < args.Count()) {
+                ifaceOverride = args.Get(i + 1)
+                i = i + 1
+            }
+            if (a == "--port" && i + 1 < args.Count()) {
+                portOverride = String.ToInt(args.Get(i + 1))
+                i = i + 1
+            }
+            if (a == "--help" || a == "-h") {
+                Program.Usage()
+                return 0
+            }
+            i = i + 1
+        }
+
+        if (listOnly) {
+            let ifs: List<string> = LinkDevice.ListInterfaces()
+            for k in 0..ifs.Count() { Console.WriteLine(ifs.Get(k)) }
+            let best: string = LinkDevice.AutoSelect()
+            Console.WriteLine("")
+            if (best != "") {
+                Console.WriteLine("interface = auto  →  " + best + (LinkDevice.IsWireless(best) ? " (Wi-Fi)" : ""))
+            } else {
+                Console.WriteLine("interface = auto  →  aucune (" + LinkDevice.LastError() + ")")
+            }
+            return 0
+        }
+
+        var cfg: BridgeConfig = new BridgeConfig()
+        if (selftest) {
+            cfg.Interface = "null"
+            cfg.Mode = "static"
+            cfg.Ip = 0x0AFF0001          // 10.255.0.1
+            cfg.Mask = 0xFFFFFF00
+            cfg.LogLevel = "debug"
+        } else {
+            cfg = BridgeConfig.Load(configPath)
+        }
+        if (ifaceOverride != "") { cfg.Interface = ifaceOverride }
+        if (portOverride > 0) { cfg.Socks.ListenPort = portOverride }
+
+        Log.SetLevel(cfg.LogLevel)
+        if (cfg.LogFile != "" && !Log.SetFile(cfg.LogFile)) {
+            Log.Warn("impossible d'ouvrir le journal " + cfg.LogFile)
+        }
+        if (!cfg.Validate()) {
+            for k in 0..cfg.Errors.Count() { Log.Error("config : " + cfg.Errors.Get(k)) }
+            return 2
+        }
+        if (checkOnly) {
+            Log.Info("configuration valide : " + configPath)
+            return 0
+        }
+        return Program.Run(cfg, selftest)
+    }
+
+    private static void Usage() {
+        Console.WriteLine("amalgame-bridge — proxy SOCKS5 routé par une pile TCP/IP dédiée (lwIP) sur une interface désignée")
+        Console.WriteLine("")
+        Console.WriteLine("  bridge [--config <fichier>] [--interface <nom>|auto] [--port <socks>]")
+        Console.WriteLine("  bridge --list-interfaces")
+        Console.WriteLine("  bridge --check-config [--config <fichier>]")
+        Console.WriteLine("  bridge --selftest [--port <socks>]")
+    }
+
+    private static int Run(BridgeConfig cfg, bool selftest) {
+        Service.RunAsService(cfg.ServiceName)
+        Log.Info("amalgame-bridge démarre (service " + cfg.ServiceName + ")")
+        if (!HostSock.Init()) {
+            Log.Error("initialisation des sockets de l'hôte impossible")
+            return 1
+        }
+
+        // ── Lien ──
+        var link: LinkDevice = null
+        var mac: List<int> = new List<int>()
+        if (selftest) {
+            mac = [0x02, 0x00, 0x5E, 0x10, 0x00, 0x01]
+            link = LinkDevice.OpenNull(mac)
+        } else {
+            if (String.ToLower(cfg.Interface) == "auto") {
+                let best: string = LinkDevice.AutoSelect()
+                if (best == "") {
+                    Log.Error("interface = auto : " + LinkDevice.LastError())
+                    return 1
+                }
+                Log.Info("interface = auto → " + best)
+                cfg.Interface = best
+            }
+            if (cfg.MacMode == "auto" && LinkDevice.IsWireless(cfg.Interface)) {
+                Log.Info("carte Wi-Fi : la pile utilise la MAC de la carte (mac = host)")
+                cfg.MacMode = "host"
+            }
+            // On ouvre d'abord sans promiscuité pour lire la MAC matérielle,
+            // puis on rouvre en promiscuité si la pile utilise une autre MAC.
+            let probe: LinkDevice = LinkDevice.OpenPhysical(cfg.Interface, false)
+            if (probe == null) {
+                Log.Error("interface '" + cfg.Interface + "' : " + LinkDevice.LastError())
+                return 1
+            }
+            mac = cfg.ResolveMac(probe.HostMac)
+            let promisc: bool = !Addr.SameMac(mac, 0, probe.HostMac)
+            if (promisc) {
+                probe.Close()
+                link = LinkDevice.OpenPhysical(cfg.Interface, true)
+                if (link == null) {
+                    Log.Error("interface '" + cfg.Interface + "' (promiscuité) : " + LinkDevice.LastError())
+                    return 1
+                }
+            } else {
+                link = probe
+            }
+            Log.Info("interface " + link.Name + " — MAC carte " + Addr.Mac(link.HostMac)
+                + ", MAC pile " + Addr.Mac(mac) + (promisc ? " (promiscuité)" : " (partagée)"))
+        }
+
+        // ── Pile ──
+        if (!link.StartStack(mac, cfg.Mtu, cfg.Hostname)) {
+            Log.Error("initialisation lwIP impossible")
+            return 1
+        }
+        for k in 0..cfg.Dns.Count() {
+            if (k < 2) { Net.SetDnsServer(k, cfg.Dns.Get(k)) }
+        }
+        if (cfg.Mode == "static") {
+            Net.SetStatic(cfg.Ip, cfg.Mask, cfg.Gateway)
+        } else {
+            let cid: List<int> = cfg.ResolveClientId(mac, link.HostMac)
+            Net.SetDhcpClientId(cid)
+            if (cid.Count() > 0) {
+                Log.Info("DHCP : identifiant client " + Bytes.Hex(cid, 0, cid.Count()))
+            }
+            if (!Net.DhcpStart()) {
+                Log.Error("démarrage DHCP impossible")
+                return 1
+            }
+            Log.Info("DHCP : demande d'adresse en cours (hôte '" + cfg.Hostname + "')")
+        }
+        if (selftest) {
+            Net.ListenEcho(7)
+            Log.Info("auto-test : echo TCP sur 10.255.0.1:7 (port 9 fermé → refus attendu)")
+        }
+
+        // ── Point de montage ──
+        let socks = new SocksServer(cfg.Socks)
+        if (!socks.Start()) { return 1 }
+
+        // ── Boucle ──
+        var lastIp: int = -1
+        var lastStats: int = Clock.NowMs()
+        var lastDiag: int = Clock.NowMs()
+        var loops: int = 0
+        var lastDhcpLog: int = Clock.NowMs()
+        while (!Service.ShouldStop()) {
+            link.Pump(512)
+            Net.Poll()
+            let ip: int = Net.Ip()
+            if (ip != lastIp) {
+                link.SetIdentity(mac, ip)
+                if (ip != 0) {
+                    // Les DNS imposés par la config priment sur ceux du DHCP.
+                    for k in 0..cfg.Dns.Count() {
+                        if (k < 2) { Net.SetDnsServer(k, cfg.Dns.Get(k)) }
+                    }
+                    Log.Info("adresse " + Addr.Ip(ip) + "/" + Addr.Ip(Net.Mask()) + " passerelle " + Addr.Ip(Net.Gateway())
+                        + " DNS " + Addr.Ip(Net.DnsServer(0)) + " " + Addr.Ip(Net.DnsServer(1)))
+                } else if (lastIp > 0) {
+                    Log.Warn("adresse perdue (bail expiré ?)")
+                }
+                lastIp = ip
+            }
+            let now: int = Clock.NowMs()
+            socks.Poll(now)
+            loops = loops + 1
+            if (ip == 0 && cfg.Mode == "dhcp" && now - lastDhcpLog >= 10000) {
+                Log.Info("DHCP : pas encore d'adresse — état " + Net.DhcpState())
+                lastDhcpLog = now
+            }
+            if (Log.IsDebug() && now - lastDiag >= 2000) {
+                Log.Debug("diag : tours=" + String.FromInt(loops) + " " + socks.Diag())
+                lastDiag = now
+                loops = 0
+            }
+            if (now - lastStats >= 300000) {
+                lastStats = now
+                Log.Info("stats : sessions=" + String.FromInt(socks.Sessions.Count()) + " " + link.Stats())
+            }
+            let fds: List<int> = socks.Fds()
+            let lfd: int = link.Fd()
+            if (lfd >= 0) { fds.Add(lfd) }
+            // Windows : Npcap n'est pas pollable par select() → attente courte.
+            var waitMs: int = 5
+            if (link.Kind == "pcap") { waitMs = 1 }
+            if (socks.Busy()) { waitMs = 0 }
+            HostSock.Wait(fds, waitMs)
+        }
+
+        // ── Arrêt ──
+        Log.Info("arrêt demandé")
+        socks.Stop()
+        if (cfg.Mode == "dhcp") { Net.DhcpRelease() }
+        let until: int = Clock.NowMs() + 300
+        while (Clock.NowMs() < until) {
+            link.Pump(64)
+            Net.Poll()
+            Service.Sleep(10)
+        }
+        link.Close()
+        Log.Info("amalgame-bridge arrêté")
+        return 0
+    }
+}

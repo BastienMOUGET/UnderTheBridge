@@ -1,0 +1,10 @@
+UnderTheBridge
+Copyright 2026 Bastien MOUGET
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes third-party software:
+  - lwIP 2.2.0 (BSD 3-Clause), vendor/lwip/ - see licenses/lwIP.txt
+  - amalgame-service 0.3.0 (Apache 2.0), vendor/amalgame-service/
+  - bdwgc (Boehm GC license), linked via the Amalgame runtime - see licenses/bdwgc.txt
+  - MinGW-w64 winpthreads (MIT), shipped as libwinpthread-1.dll - see licenses/winpthreads.txt

@@ -1,0 +1,980 @@
+namespace Amalgame.Service
+
+// ── Service ───────────────────────────────────────────
+//
+// Long-running background process primitives. The minimum surface
+// a daemon needs to run cleanly under systemd / launchd / Windows
+// Service Manager: catch the shutdown signal, exit the main loop
+// promptly, and sleep between iterations without burning CPU.
+//
+// Typical usage:
+//
+//     import Amalgame.Service
+//     import Amalgame.Logging
+//
+//     public class Program {
+//         public static int Main(List<string> args) {
+//             Log.Info("starting")
+//             Service.RunAsService("my-daemon")   // see notes below
+//             while (!Service.ShouldStop()) {
+//                 // do one unit of work
+//                 Service.Sleep(5000)
+//             }
+//             Log.Info("shutting down cleanly")
+//             return 0
+//         }
+//     }
+//
+// Two install entry points:
+//
+//   - `Service.Install()` — install the OS signal/Ctrl handler so
+//     `ShouldStop()` flips on SIGTERM / SIGINT (POSIX) or CTRL_C /
+//     CTRL_CLOSE / CTRL_SHUTDOWN (Windows). Console-only; works
+//     anywhere. Backward-compatible — pre-v0.2.0 code keeps using
+//     this exactly as before.
+//
+//   - `Service.RunAsService(name)` — superset of `Install()`. On
+//     Linux/macOS it's identical (the name is ignored). On Windows
+//     it additionally bootstraps the Service Control Manager (SCM)
+//     dispatcher on a background thread so the same binary runs
+//     natively as a Windows service when registered with
+//     `sc create <name> binPath= ...` — no NSSM wrapper exe needed.
+//     Console-mode launch still works (SCM dispatcher returns
+//     immediately with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and
+//     the binary keeps behaving like a plain console daemon).
+//     Cleanup (SetServiceStatus(STOPPED) → SCM connection teardown)
+//     happens automatically at process exit via atexit().
+//
+// Cross-platform: POSIX `signal()` for SIGTERM / SIGINT on Linux
+// and macOS; `SetConsoleCtrlHandler` for CTRL_C / CTRL_CLOSE /
+// CTRL_SHUTDOWN on Windows; `StartServiceCtrlDispatcher` +
+// `RegisterServiceCtrlHandlerEx` + `SetServiceStatus` for native
+// Windows service mode. All compile to the same Amalgame surface;
+// callers don't branch on platform.
+//
+// Single-process scope. `ShouldStop()` is a single atomic flag —
+// not a per-thread token. If you spawn worker threads, they all
+// observe the same flag, which is what you want for "the whole
+// service is shutting down".
+//
+// History:
+//   - v0.1.0 — implementation moved from `runtime/Amalgame_Service.h`
+//     to AM (post-v0.7.5). Console-only signal/Ctrl handler.
+//   - v0.2.0 — native Windows SCM dispatcher
+//     (`RunAsService(name)`); drops the NSSM dependency in
+//     `amc new --template service` scaffolds.
+//   - v0.3.0 — session / power events (`EnableSessionEvents()` +
+//     `PollEvents()`), Windows session helpers (user, SID, state,
+//     lock, admin), `SendMessage` and `LaunchInSession` to reach the
+//     interactive desktop from session 0.
+//
+// Session helpers resolve wtsapi32 / userenv at runtime
+// (LoadLibrary + GetProcAddress): MinGW links neither by default
+// and the manifest has no per-platform `libs`, so a static import
+// would break every non-Windows consumer of this package.
+
+@c_link "advapi32"
+
+@c {
+    #include <signal.h>
+    #include <stdlib.h>   /* atexit */
+    #include <string.h>
+    #include <stdint.h>
+
+    /* ── Event queue (all platforms) ──
+     *
+     * Fixed ring buffer filled by the SCM handler thread (or by
+     * `InjectEvent`) and drained by `PollEvents()` on the user
+     * thread. On overflow the oldest event is dropped — a consumer
+     * that stops polling must not grow memory without bound. */
+    #define AMALGAME_SERVICE_QCAP 256
+    typedef struct { int kind; int64_t session; int64_t nanos; } Amalgame_Service_Evt;
+    static Amalgame_Service_Evt Amalgame_Service_Q[AMALGAME_SERVICE_QCAP];
+    static int Amalgame_Service_QHead = 0;
+    static int Amalgame_Service_QLen  = 0;
+    static Amalgame_Service_Evt Amalgame_Service_Popped;
+    #ifdef _WIN32
+        /* SRWLOCK, INIT_ONCE and the token-elevation API are Vista+;
+         * older MinGW toolchains default _WIN32_WINNT below that. */
+        #ifndef _WIN32_WINNT
+            #define _WIN32_WINNT 0x0601
+        #endif
+        #if _WIN32_WINNT < 0x0600
+            #error "amalgame-service needs _WIN32_WINNT >= 0x0600 (Vista+)"
+        #endif
+        #include <windows.h>
+        #include <wchar.h>
+        static SRWLOCK Amalgame_Service_QLock = SRWLOCK_INIT;
+        #define AMALGAME_SERVICE_QLOCK()   AcquireSRWLockExclusive(&Amalgame_Service_QLock)
+        #define AMALGAME_SERVICE_QUNLOCK() ReleaseSRWLockExclusive(&Amalgame_Service_QLock)
+    #else
+        #include <pthread.h>
+        #include <time.h>
+        static pthread_mutex_t Amalgame_Service_QLock = PTHREAD_MUTEX_INITIALIZER;
+        #define AMALGAME_SERVICE_QLOCK()   pthread_mutex_lock(&Amalgame_Service_QLock)
+        #define AMALGAME_SERVICE_QUNLOCK() pthread_mutex_unlock(&Amalgame_Service_QLock)
+    #endif
+
+    static int64_t Amalgame_Service_NowNanos(void) {
+    #ifdef _WIN32
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER u;
+        u.LowPart  = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        return ((int64_t) u.QuadPart - 116444736000000000LL) * 100LL;
+    #else
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+        return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
+    #endif
+    }
+
+    static void Amalgame_Service_Push(int kind, int64_t session) {
+        int64_t now = Amalgame_Service_NowNanos();
+        AMALGAME_SERVICE_QLOCK();
+        if (Amalgame_Service_QLen == AMALGAME_SERVICE_QCAP) {
+            Amalgame_Service_QHead = (Amalgame_Service_QHead + 1) % AMALGAME_SERVICE_QCAP;
+            Amalgame_Service_QLen--;
+        }
+        int slot = (Amalgame_Service_QHead + Amalgame_Service_QLen) % AMALGAME_SERVICE_QCAP;
+        Amalgame_Service_Q[slot].kind    = kind;
+        Amalgame_Service_Q[slot].session = session;
+        Amalgame_Service_Q[slot].nanos   = now;
+        Amalgame_Service_QLen++;
+        AMALGAME_SERVICE_QUNLOCK();
+    }
+
+    /* Pops into `Amalgame_Service_Popped`. 1 if an event was
+     * popped, 0 if the queue was empty. Single consumer. */
+    static int Amalgame_Service_Pop(void) {
+        int got = 0;
+        AMALGAME_SERVICE_QLOCK();
+        if (Amalgame_Service_QLen > 0) {
+            Amalgame_Service_Popped = Amalgame_Service_Q[Amalgame_Service_QHead];
+            Amalgame_Service_QHead = (Amalgame_Service_QHead + 1) % AMALGAME_SERVICE_QCAP;
+            Amalgame_Service_QLen--;
+            got = 1;
+        }
+        AMALGAME_SERVICE_QUNLOCK();
+        return got;
+    }
+
+    /* Event kind codes. 1..11 mirror the WTS_* session-change
+     * codes so the SCM handler forwards them unchanged. */
+    #define AMALGAME_SERVICE_EVT_SUSPEND  20
+    #define AMALGAME_SERVICE_EVT_RESUME   21
+    #define AMALGAME_SERVICE_EVT_SHUTDOWN 30
+    #define AMALGAME_SERVICE_EVT_STOP     31
+
+    #ifdef _WIN32
+        #include <wtsapi32.h>
+        #include <sddl.h>
+        static volatile LONG Amalgame_Service_Stopping = 0;
+        static volatile LONG Amalgame_Service_ExtraAccept = 0;
+
+        static BOOL WINAPI Amalgame_Service_OnCtrl(DWORD ctrlType) {
+            /* Catch CTRL_C, CTRL_BREAK, CTRL_CLOSE, CTRL_LOGOFF,
+             * CTRL_SHUTDOWN. Returning TRUE tells Windows we handled
+             * it — the process is not terminated; the main loop
+             * notices the flag on next ShouldStop. */
+            (void) ctrlType;
+            InterlockedExchange(&Amalgame_Service_Stopping, 1);
+            return TRUE;
+        }
+
+        /* ── SCM (Service Control Manager) bootstrap ──
+         *
+         * v0.2.0 replaces the NSSM-wrapper pattern (external exe
+         * that spawns our console binary and proxies SCM control
+         * codes) with an in-process SCM dispatcher. The same binary
+         * runs both as a console app (StartServiceCtrlDispatcher
+         * returns ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and we
+         * fall through to console behaviour) and as a native
+         * Windows service (SCM calls ServiceMain on a fresh thread,
+         * which registers the handler, reports RUNNING, then waits
+         * on an event flipped by atexit during process teardown). */
+        static HANDLE                 Amalgame_Service_DispatcherThread = NULL;
+        static HANDLE                 Amalgame_Service_ShutdownEvent    = NULL;
+        static SERVICE_STATUS_HANDLE  Amalgame_Service_StatusHandle     = NULL;
+        static SERVICE_STATUS         Amalgame_Service_Status           = {0};
+        static char*                  Amalgame_Service_Name             = NULL;
+
+        static void Amalgame_Service_ReportStatus(DWORD state, DWORD waitHint) {
+            Amalgame_Service_Status.dwServiceType             = SERVICE_WIN32_OWN_PROCESS;
+            Amalgame_Service_Status.dwCurrentState            = state;
+            Amalgame_Service_Status.dwWin32ExitCode           = NO_ERROR;
+            Amalgame_Service_Status.dwServiceSpecificExitCode = 0;
+            Amalgame_Service_Status.dwWaitHint                = waitHint;
+            Amalgame_Service_Status.dwControlsAccepted        =
+                (state == SERVICE_RUNNING)
+                    ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+                       | (DWORD) Amalgame_Service_ExtraAccept)
+                    : 0;
+            if (state == SERVICE_RUNNING || state == SERVICE_STOPPED)
+                Amalgame_Service_Status.dwCheckPoint = 0;
+            else
+                Amalgame_Service_Status.dwCheckPoint++;
+            if (Amalgame_Service_StatusHandle)
+                SetServiceStatus(Amalgame_Service_StatusHandle, &Amalgame_Service_Status);
+        }
+
+        static DWORD WINAPI Amalgame_Service_HandlerEx(
+            DWORD ctrlCode, DWORD evtType, LPVOID evtData, LPVOID ctx)
+        {
+            (void) ctx;
+            switch (ctrlCode) {
+                case SERVICE_CONTROL_SESSIONCHANGE: {
+                    WTSSESSION_NOTIFICATION* n = (WTSSESSION_NOTIFICATION*) evtData;
+                    Amalgame_Service_Push((int) evtType,
+                                          n ? (int64_t) n->dwSessionId : -1);
+                    return NO_ERROR;
+                }
+                case SERVICE_CONTROL_POWEREVENT:
+                    /* RESUMEAUTOMATIC is sent on every wake;
+                     * RESUMESUSPEND only when a user is present, so
+                     * forwarding both would duplicate the resume. */
+                    if (evtType == PBT_APMSUSPEND)
+                        Amalgame_Service_Push(AMALGAME_SERVICE_EVT_SUSPEND, -1);
+                    else if (evtType == PBT_APMRESUMEAUTOMATIC)
+                        Amalgame_Service_Push(AMALGAME_SERVICE_EVT_RESUME, -1);
+                    return NO_ERROR;
+                case SERVICE_CONTROL_STOP:
+                case SERVICE_CONTROL_SHUTDOWN:
+                    Amalgame_Service_Push(ctrlCode == SERVICE_CONTROL_SHUTDOWN
+                                              ? AMALGAME_SERVICE_EVT_SHUTDOWN
+                                              : AMALGAME_SERVICE_EVT_STOP, -1);
+                    Amalgame_Service_ReportStatus(SERVICE_STOP_PENDING, 30000);
+                    InterlockedExchange(&Amalgame_Service_Stopping, 1);
+                    if (Amalgame_Service_ShutdownEvent)
+                        SetEvent(Amalgame_Service_ShutdownEvent);
+                    return NO_ERROR;
+                case SERVICE_CONTROL_INTERROGATE:
+                    if (Amalgame_Service_StatusHandle)
+                        SetServiceStatus(Amalgame_Service_StatusHandle,
+                                         &Amalgame_Service_Status);
+                    return NO_ERROR;
+                default:
+                    return ERROR_CALL_NOT_IMPLEMENTED;
+            }
+        }
+
+        static void WINAPI Amalgame_Service_ServiceMain(DWORD argc, LPSTR* argv) {
+            (void) argc; (void) argv;
+            Amalgame_Service_StatusHandle = RegisterServiceCtrlHandlerExA(
+                Amalgame_Service_Name ? Amalgame_Service_Name : "",
+                Amalgame_Service_HandlerEx,
+                NULL);
+            if (!Amalgame_Service_StatusHandle) return;
+
+            Amalgame_Service_ReportStatus(SERVICE_START_PENDING, 5000);
+            Amalgame_Service_ReportStatus(SERVICE_RUNNING, 0);
+
+            /* Park here until the user loop returns from Main()
+             * (atexit signals the event) or SCM sends STOP (handler
+             * signals the event). Either way, ServiceMain returns,
+             * StartServiceCtrlDispatcher returns, and the worker
+             * thread exits cleanly. */
+            if (Amalgame_Service_ShutdownEvent)
+                WaitForSingleObject(Amalgame_Service_ShutdownEvent, INFINITE);
+
+            Amalgame_Service_ReportStatus(SERVICE_STOPPED, 0);
+        }
+
+        static DWORD WINAPI Amalgame_Service_DispatcherFn(LPVOID arg) {
+            (void) arg;
+            SERVICE_TABLE_ENTRYA tbl[] = {
+                { Amalgame_Service_Name ? Amalgame_Service_Name : (LPSTR) "",
+                  Amalgame_Service_ServiceMain },
+                { NULL, NULL }
+            };
+            /* Blocks until ServiceMain returns when running under
+             * SCM; returns ~immediately with
+             * ERROR_FAILED_SERVICE_CONTROLLER_CONNECT when launched
+             * from a console — both are normal outcomes. */
+            StartServiceCtrlDispatcherA(tbl);
+            return 0;
+        }
+
+        static void Amalgame_Service_AtExit(void) {
+            /* Signal ServiceMain to exit (if it was ever entered) so
+             * SCM sees a clean STOPPED transition. Wait briefly for
+             * the dispatcher thread to wind down — capped so a
+             * misbehaving SCM can't keep the process alive. */
+            if (Amalgame_Service_ShutdownEvent)
+                SetEvent(Amalgame_Service_ShutdownEvent);
+            if (Amalgame_Service_DispatcherThread) {
+                WaitForSingleObject(Amalgame_Service_DispatcherThread, 5000);
+                CloseHandle(Amalgame_Service_DispatcherThread);
+                Amalgame_Service_DispatcherThread = NULL;
+            }
+            if (Amalgame_Service_ShutdownEvent) {
+                CloseHandle(Amalgame_Service_ShutdownEvent);
+                Amalgame_Service_ShutdownEvent = NULL;
+            }
+        }
+
+        /* ── Session helpers (wtsapi32 / userenv, resolved lazily) ── */
+        typedef BOOL (WINAPI *Amalgame_Service_PFN_QueryInfoW)(HANDLE, DWORD, WTS_INFO_CLASS, LPWSTR*, DWORD*);
+        typedef void (WINAPI *Amalgame_Service_PFN_FreeMemory)(PVOID);
+        typedef BOOL (WINAPI *Amalgame_Service_PFN_EnumW)(HANDLE, DWORD, DWORD, PWTS_SESSION_INFOW*, DWORD*);
+        typedef BOOL (WINAPI *Amalgame_Service_PFN_QueryUserToken)(ULONG, PHANDLE);
+        typedef BOOL (WINAPI *Amalgame_Service_PFN_SendMessageW)(HANDLE, DWORD, LPWSTR, DWORD, LPWSTR, DWORD, DWORD, DWORD, DWORD*, BOOL);
+        typedef BOOL (WINAPI *Amalgame_Service_PFN_CreateEnv)(LPVOID*, HANDLE, BOOL);
+        typedef BOOL (WINAPI *Amalgame_Service_PFN_DestroyEnv)(LPVOID);
+
+        static Amalgame_Service_PFN_QueryInfoW      Amalgame_Service_WtsQueryInfo  = NULL;
+        static Amalgame_Service_PFN_FreeMemory      Amalgame_Service_WtsFree       = NULL;
+        static Amalgame_Service_PFN_EnumW           Amalgame_Service_WtsEnum       = NULL;
+        static Amalgame_Service_PFN_QueryUserToken  Amalgame_Service_WtsUserToken  = NULL;
+        static Amalgame_Service_PFN_SendMessageW    Amalgame_Service_WtsSendMsg    = NULL;
+        static Amalgame_Service_PFN_CreateEnv       Amalgame_Service_CreateEnv     = NULL;
+        static Amalgame_Service_PFN_DestroyEnv      Amalgame_Service_DestroyEnv    = NULL;
+        static INIT_ONCE Amalgame_Service_WtsOnce = INIT_ONCE_STATIC_INIT;
+
+        static BOOL CALLBACK Amalgame_Service_WtsInit(PINIT_ONCE o, PVOID p, PVOID* c) {
+            (void) o; (void) p; (void) c;
+            HMODULE w = LoadLibraryA("wtsapi32.dll");
+            if (w) {
+                Amalgame_Service_WtsQueryInfo = (Amalgame_Service_PFN_QueryInfoW)     GetProcAddress(w, "WTSQuerySessionInformationW");
+                Amalgame_Service_WtsFree      = (Amalgame_Service_PFN_FreeMemory)     GetProcAddress(w, "WTSFreeMemory");
+                Amalgame_Service_WtsEnum      = (Amalgame_Service_PFN_EnumW)          GetProcAddress(w, "WTSEnumerateSessionsW");
+                Amalgame_Service_WtsUserToken = (Amalgame_Service_PFN_QueryUserToken) GetProcAddress(w, "WTSQueryUserToken");
+                Amalgame_Service_WtsSendMsg   = (Amalgame_Service_PFN_SendMessageW)   GetProcAddress(w, "WTSSendMessageW");
+            }
+            HMODULE u = LoadLibraryA("userenv.dll");
+            if (u) {
+                Amalgame_Service_CreateEnv  = (Amalgame_Service_PFN_CreateEnv)  GetProcAddress(u, "CreateEnvironmentBlock");
+                Amalgame_Service_DestroyEnv = (Amalgame_Service_PFN_DestroyEnv) GetProcAddress(u, "DestroyEnvironmentBlock");
+            }
+            return TRUE;
+        }
+
+        static void Amalgame_Service_WtsLoad(void) {
+            InitOnceExecuteOnce(&Amalgame_Service_WtsOnce, Amalgame_Service_WtsInit, NULL, NULL);
+        }
+
+        static char* Amalgame_Service_W2U(const wchar_t* w) {
+            if (!w) return (char*) "";
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+            if (n <= 0) return (char*) "";
+            char* out = (char*) GC_MALLOC(n);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL);
+            return out;
+        }
+
+        /* UTF-8 → UTF-16, GC-allocated. Never NULL. */
+        static wchar_t* Amalgame_Service_U2W(const char* s) {
+            if (!s) s = "";
+            int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+            if (n <= 0) n = 1;
+            wchar_t* out = (wchar_t*) GC_MALLOC(sizeof(wchar_t) * n);
+            out[0] = 0;
+            MultiByteToWideChar(CP_UTF8, 0, s, -1, out, n);
+            return out;
+        }
+
+        /* String-valued WTS info class for `session`, UTF-8. "" on
+         * failure (bad session, no user, wtsapi32 missing). */
+        static char* Amalgame_Service_WtsString(DWORD session, WTS_INFO_CLASS cls) {
+            Amalgame_Service_WtsLoad();
+            if (!Amalgame_Service_WtsQueryInfo || !Amalgame_Service_WtsFree) return (char*) "";
+            LPWSTR buf = NULL;
+            DWORD len = 0;
+            if (!Amalgame_Service_WtsQueryInfo(WTS_CURRENT_SERVER_HANDLE, session, cls, &buf, &len) || !buf)
+                return (char*) "";
+            char* out = Amalgame_Service_W2U(buf);
+            Amalgame_Service_WtsFree(buf);
+            return out;
+        }
+
+        /* Primary token of the user logged on to `session`. Needs
+         * SE_TCB_NAME, i.e. the process must run as LocalSystem —
+         * returns NULL in console mode. Caller closes the handle. */
+        static HANDLE Amalgame_Service_UserToken(DWORD session) {
+            Amalgame_Service_WtsLoad();
+            if (!Amalgame_Service_WtsUserToken) return NULL;
+            HANDLE tok = NULL;
+            if (!Amalgame_Service_WtsUserToken(session, &tok)) return NULL;
+            return tok;
+        }
+
+        /* Layout prefix of WTSINFOEXW (level 1). Declared locally:
+         * older MinGW headers lack WTSINFOEX. `Data` is a union
+         * holding LARGE_INTEGERs, hence the 8-byte alignment pad. */
+        typedef struct {
+            DWORD Level;
+            DWORD Pad;
+            ULONG SessionId;
+            INT   SessionState;
+            LONG  SessionFlags;
+        } Amalgame_Service_InfoExHead;
+        #define AMALGAME_SERVICE_WTS_SESSIONINFOEX ((WTS_INFO_CLASS) 25)
+    #else
+        #include <time.h>
+        static volatile sig_atomic_t Amalgame_Service_Stopping = 0;
+
+        static void Amalgame_Service_OnSignal(int sig) {
+            (void) sig;
+            Amalgame_Service_Stopping = 1;
+        }
+    #endif
+}
+
+// One session / power notification, as returned by
+// `Service.PollEvents()`. `Kind` is one of: ConsoleConnect,
+// ConsoleDisconnect, RemoteConnect, RemoteDisconnect, Logon, Logoff,
+// Lock, Unlock, RemoteControl, SessionCreate, SessionTerminate,
+// Suspend, Resume, Shutdown, Stop. `SessionId` is -1 for events not
+// tied to a session (power, shutdown). `TimeNanos` is the UTC wall
+// clock (ns since epoch) at which the SCM delivered the event.
+public class ServiceEvent {
+    public Kind:      string
+    public SessionId: int
+    public TimeNanos: int
+
+    public ServiceEvent(kind: string, sessionId: int, timeNanos: int) {
+        this.Kind      = kind
+        this.SessionId = sessionId
+        this.TimeNanos = timeNanos
+    }
+}
+
+public class Service {
+    public Service() {}
+
+    // Install the shutdown-signal handler. Call exactly once early
+    // in `Main()`, before the work loop. No-op if called more than
+    // once on the same process — the OS just re-registers the same
+    // handler.
+    public static void Install() {
+        @c {
+        #ifdef _WIN32
+            SetConsoleCtrlHandler(Amalgame_Service_OnCtrl, TRUE);
+        #else
+            /* Best-effort: ignore errors. A failure here just means
+             * the shutdown path falls back to whatever the default
+             * disposition is (typically: SIGTERM kills the process
+             * abruptly). The service still runs; it just won't
+             * clean-shutdown. */
+            struct sigaction sa;
+            sa.sa_handler = Amalgame_Service_OnSignal;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;  /* not SA_RESTART — let blocking syscalls return EINTR */
+            sigaction(SIGTERM, &sa, NULL);
+            sigaction(SIGINT,  &sa, NULL);
+        #endif
+        }
+    }
+
+    // Superset of `Install()` that additionally bootstraps the
+    // native Windows Service Control Manager dispatcher when
+    // running as a service. Call once at the top of `Main()`
+    // instead of `Install()`. The same binary keeps working in
+    // console mode (dispatcher returns immediately) and as a
+    // registered Windows service (dispatcher blocks on a worker
+    // thread until SCM tears the service down). `name` must match
+    // the name used at `sc create <name>` registration time on
+    // Windows; it is ignored on Linux/macOS.
+    //
+    // No follow-up call is required — cleanup is registered via
+    // `atexit()` so the SCM connection drops cleanly when the
+    // process exits, whether the loop returns normally or the
+    // runtime tears down on exception.
+    public static void RunAsService(name: string) {
+        // POSIX path: identical to Install(). Name is ignored —
+        // the OS-level integration on Linux/macOS lives in the
+        // unit file / launchd plist, not the binary.
+        Service.Install()
+        @c {
+        #ifdef _WIN32
+            /* Idempotent: a second call from the same process is a
+             * no-op (the dispatcher thread is already running). */
+            if (Amalgame_Service_DispatcherThread != NULL) return;
+
+            /* strdup the name into a stable buffer — the
+             * SERVICE_TABLE_ENTRY consumed by SCM holds the
+             * pointer for the lifetime of the dispatcher. */
+            if (name && *name) {
+                Amalgame_Service_Name = _strdup(name);
+            } else {
+                Amalgame_Service_Name = _strdup("");
+            }
+
+            /* Manual-reset event so both the handler (on STOP) and
+             * AtExit (on normal teardown) can flip it from any
+             * thread without lost-wakeup races. */
+            Amalgame_Service_ShutdownEvent =
+                CreateEventA(NULL, TRUE, FALSE, NULL);
+
+            Amalgame_Service_DispatcherThread = CreateThread(
+                NULL, 0, Amalgame_Service_DispatcherFn, NULL, 0, NULL);
+
+            atexit(Amalgame_Service_AtExit);
+        #else
+            (void) name;  /* silence unused-param on POSIX */
+        #endif
+        }
+    }
+
+    // True after the OS has delivered a shutdown signal. The loop
+    // body should check this on every iteration and exit promptly.
+    // Calling repeatedly is cheap (single memory read).
+    public static bool ShouldStop() {
+        @c { return Amalgame_Service_Stopping ? 1 : 0; }
+    }
+
+    // Programmatic shutdown request — flip the flag without waiting
+    // for an external signal. Useful from in-process triggers
+    // (admin HTTP endpoint, watchdog timer, fatal error in a sub-
+    // task). The next `ShouldStop()` call returns true.
+    public static void RequestStop() {
+        @c {
+        #ifdef _WIN32
+            InterlockedExchange(&Amalgame_Service_Stopping, 1);
+            if (Amalgame_Service_ShutdownEvent)
+                SetEvent(Amalgame_Service_ShutdownEvent);
+        #else
+            Amalgame_Service_Stopping = 1;
+        #endif
+        }
+    }
+
+    // Sleep for `ms` milliseconds, returning early if a shutdown
+    // signal arrives during the sleep. POSIX path uses `nanosleep`
+    // which is naturally interruptible; Windows path slices into
+    // 100ms chunks so a Ctrl-handler callback interrupts within
+    // bounded latency.
+    public static void Sleep(ms: int) {
+        @c {
+            if (ms <= 0) return;
+        #ifdef _WIN32
+            /* Slice the sleep into 100ms chunks so a
+             * SetConsoleCtrlHandler call mid-sleep can interrupt
+             * within bounded latency. Windows has no portable
+             * `nanosleep`-equivalent that's interruptible by a
+             * Ctrl-handler callback, so polling is the cleanest
+             * path. */
+            i64 remaining = ms;
+            while (remaining > 0) {
+                if (Amalgame_Service_Stopping) return;
+                DWORD chunk = remaining > 100 ? 100 : (DWORD) remaining;
+                Sleep(chunk);
+                remaining -= chunk;
+            }
+        #else
+            if (Amalgame_Service_Stopping) return;
+            struct timespec ts;
+            ts.tv_sec  = (time_t) (ms / 1000);
+            ts.tv_nsec = (long)   ((ms % 1000) * 1000000L);
+            nanosleep(&ts, NULL);
+        #endif
+        }
+    }
+
+    // ── Session / power events (v0.3.0) ──────────────────
+
+    // Ask the SCM to also deliver session-change (logon, logoff,
+    // lock, unlock, console/remote connect…) and power (suspend,
+    // resume) notifications. Call before or after `RunAsService`;
+    // if the service is already RUNNING the new control set is
+    // reported immediately. No-op on POSIX and in console mode —
+    // the queue then only receives `InjectEvent` entries (and
+    // Stop/Shutdown when running under the SCM).
+    public static void EnableSessionEvents() {
+        @c {
+        #ifdef _WIN32
+            InterlockedExchange(&Amalgame_Service_ExtraAccept,
+                (LONG) (SERVICE_ACCEPT_SESSIONCHANGE | SERVICE_ACCEPT_POWEREVENT));
+            if (Amalgame_Service_StatusHandle &&
+                Amalgame_Service_Status.dwCurrentState == SERVICE_RUNNING)
+                Amalgame_Service_ReportStatus(SERVICE_RUNNING, 0);
+        #endif
+        }
+    }
+
+    // Drain every queued event, oldest first. Never blocks; returns
+    // an empty list when nothing happened. The queue holds the last
+    // 256 events — poll at least every few seconds.
+    public static List<ServiceEvent> PollEvents() {
+        let out: List<ServiceEvent> = new List<ServiceEvent>()
+        while (Service.popEvent()) {
+            let kind: string = Service.EventKindName(Service.poppedKind())
+            out.Add(new ServiceEvent(kind, Service.poppedSession(), Service.poppedNanos()))
+        }
+        return out
+    }
+
+    // Enqueue a synthetic event, timestamped now. `kind` must be one
+    // of the `ServiceEvent.Kind` names (unknown names are ignored).
+    // For tests, and for apps that want their own markers (e.g. a
+    // "service started" event) to flow through the same queue.
+    public static void InjectEvent(kind: string, sessionId: int) {
+        let code: int = Service.EventKindCode(kind)
+        if (code == 0) { return }
+        @c { Amalgame_Service_Push((int) code, (int64_t) sessionId); }
+    }
+
+    // Name of an event kind code ("Unknown" if not a known code).
+    public static string EventKindName(code: int) {
+        return match code {
+            1  => "ConsoleConnect"
+            2  => "ConsoleDisconnect"
+            3  => "RemoteConnect"
+            4  => "RemoteDisconnect"
+            5  => "Logon"
+            6  => "Logoff"
+            7  => "Lock"
+            8  => "Unlock"
+            9  => "RemoteControl"
+            10 => "SessionCreate"
+            11 => "SessionTerminate"
+            20 => "Suspend"
+            21 => "Resume"
+            30 => "Shutdown"
+            31 => "Stop"
+            _  => "Unknown"
+        }
+    }
+
+    // Inverse of `EventKindName`; 0 for an unknown name.
+    public static int EventKindCode(kind: string) {
+        for c in 1..32 {
+            if (Service.EventKindName(c) == kind) { return c }
+        }
+        return 0
+    }
+
+    static bool popEvent() {
+        @c { return Amalgame_Service_Pop() ? 1 : 0; }
+    }
+
+    static int poppedKind() {
+        @c { return (i64) Amalgame_Service_Popped.kind; }
+    }
+
+    static int poppedSession() {
+        @c { return (i64) Amalgame_Service_Popped.session; }
+    }
+
+    static int poppedNanos() {
+        @c { return (i64) Amalgame_Service_Popped.nanos; }
+    }
+
+    // ── Windows sessions (v0.3.0) ────────────────────────
+    //
+    // Everything below is Windows-only and returns an empty / false /
+    // -1 value on POSIX. Helpers marked "LocalSystem" need the
+    // process to run as a service under the SYSTEM account
+    // (WTSQueryUserToken requires SE_TCB_NAME); in console mode
+    // they fail the same way.
+
+    // True when the process was started by the SCM (as opposed to
+    // a console launch of the same binary).
+    public static bool IsRunningUnderScm() {
+        @c {
+        #ifdef _WIN32
+            return Amalgame_Service_StatusHandle != NULL ? 1 : 0;
+        #else
+            return 0;
+        #endif
+        }
+    }
+
+    // Session attached to the physical console, or -1 if none
+    // (e.g. during a console session switch).
+    public static int ActiveConsoleSession() {
+        @c {
+        #ifdef _WIN32
+            DWORD id = WTSGetActiveConsoleSessionId();
+            return id == 0xFFFFFFFF ? -1 : (i64) id;
+        #else
+            return -1;
+        #endif
+        }
+    }
+
+    // Ids of every session that has a logged-on user (active,
+    // disconnected or locked), console and RDP alike. Excludes
+    // session 0 and the listener / login-screen sessions.
+    public static List<int> UserSessions() {
+        let out: List<int> = new List<int>()
+        @c {
+        #ifdef _WIN32
+            Amalgame_Service_WtsLoad();
+            if (Amalgame_Service_WtsEnum && Amalgame_Service_WtsFree) {
+                PWTS_SESSION_INFOW info = NULL;
+                DWORD count = 0;
+                if (Amalgame_Service_WtsEnum(WTS_CURRENT_SERVER_HANDLE, 0, 1, &info, &count)) {
+                    for (DWORD i = 0; i < count; i++) {
+                        char* u = Amalgame_Service_WtsString(info[i].SessionId, WTSUserName);
+                        if (u && *u)
+                            AmalgameList_add(out, (void*) (intptr_t) info[i].SessionId);
+                    }
+                    Amalgame_Service_WtsFree(info);
+                }
+            }
+        #endif
+        }
+        return out
+    }
+
+    // Account name logged on to `sessionId` (e.g. "bmouget"), or ""
+    // if the session has no user.
+    public static string SessionUserName(sessionId: int) {
+        @c {
+        #ifdef _WIN32
+            return Amalgame_Service_WtsString((DWORD) sessionId, WTSUserName);
+        #else
+            return (char*) "";
+        #endif
+        }
+    }
+
+    // Domain (or machine name for local accounts) of the user
+    // logged on to `sessionId`, or "".
+    public static string SessionDomain(sessionId: int) {
+        @c {
+        #ifdef _WIN32
+            return Amalgame_Service_WtsString((DWORD) sessionId, WTSDomainName);
+        #else
+            return (char*) "";
+        #endif
+        }
+    }
+
+    // Connection state of `sessionId`: Active, Connected,
+    // ConnectQuery, Shadow, Disconnected, Idle, Listen, Reset, Down,
+    // Init — or "Unknown".
+    public static string SessionState(sessionId: int) {
+        var code: int = -1
+        @c {
+        #ifdef _WIN32
+            Amalgame_Service_WtsLoad();
+            if (Amalgame_Service_WtsQueryInfo && Amalgame_Service_WtsFree) {
+                LPWSTR buf = NULL;
+                DWORD len = 0;
+                if (Amalgame_Service_WtsQueryInfo(WTS_CURRENT_SERVER_HANDLE, (DWORD) sessionId,
+                                                  WTSConnectState, &buf, &len) && buf) {
+                    if (len >= sizeof(INT)) code = (i64) *(INT*) buf;
+                    Amalgame_Service_WtsFree(buf);
+                }
+            }
+        #endif
+        }
+        return match code {
+            0 => "Active"
+            1 => "Connected"
+            2 => "ConnectQuery"
+            3 => "Shadow"
+            4 => "Disconnected"
+            5 => "Idle"
+            6 => "Listen"
+            7 => "Reset"
+            8 => "Down"
+            9 => "Init"
+            _ => "Unknown"
+        }
+    }
+
+    // "Locked", "Unlocked" or "Unknown" (POSIX, no such session,
+    // or pre-Windows 8 where WTSSessionInfoEx is unreliable — the
+    // flag is inverted on Windows 7 / Server 2008 R2). Use it at
+    // service start to seed the state the event stream will then
+    // keep up to date.
+    public static string SessionLockState(sessionId: int) {
+        var flags: int = -1
+        @c {
+        #ifdef _WIN32
+            Amalgame_Service_WtsLoad();
+            if (Amalgame_Service_WtsQueryInfo && Amalgame_Service_WtsFree) {
+                LPWSTR buf = NULL;
+                DWORD len = 0;
+                if (Amalgame_Service_WtsQueryInfo(WTS_CURRENT_SERVER_HANDLE, (DWORD) sessionId,
+                                                  AMALGAME_SERVICE_WTS_SESSIONINFOEX, &buf, &len) && buf) {
+                    Amalgame_Service_InfoExHead* h = (Amalgame_Service_InfoExHead*) buf;
+                    if (len >= sizeof(*h) && h->Level == 1) flags = (i64) h->SessionFlags;
+                    Amalgame_Service_WtsFree(buf);
+                }
+            }
+        #endif
+        }
+        if (flags == 0) { return "Locked" }
+        if (flags == 1) { return "Unlocked" }
+        return "Unknown"
+    }
+
+    // String SID ("S-1-5-21-…") of the user logged on to
+    // `sessionId` — stable across renames, unlike the account name.
+    // "" on failure. LocalSystem only.
+    public static string SessionUserSid(sessionId: int) {
+        @c {
+        #ifdef _WIN32
+            HANDLE tok = Amalgame_Service_UserToken((DWORD) sessionId);
+            if (!tok) return (char*) "";
+            char* res = (char*) "";
+            DWORD need = 0;
+            GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+            if (need > 0) {
+                TOKEN_USER* tu = (TOKEN_USER*) GC_MALLOC(need);
+                if (GetTokenInformation(tok, TokenUser, tu, need, &need)) {
+                    LPSTR s = NULL;
+                    if (ConvertSidToStringSidA(tu->User.Sid, &s) && s) {
+                        size_t n = strlen(s);
+                        res = (char*) GC_MALLOC(n + 1);
+                        memcpy(res, s, n + 1);
+                        LocalFree(s);
+                    }
+                }
+            }
+            CloseHandle(tok);
+            return res;
+        #else
+            return (char*) "";
+        #endif
+        }
+    }
+
+    // True if the user logged on to `sessionId` belongs to the local
+    // Administrators group — checked on the elevated (linked) token,
+    // so a UAC-filtered admin still counts. LocalSystem only.
+    public static bool SessionUserIsAdmin(sessionId: int) {
+        @c {
+        #ifdef _WIN32
+            HANDLE tok = Amalgame_Service_UserToken((DWORD) sessionId);
+            if (!tok) return 0;
+            HANDLE check = tok;
+            HANDLE linked = NULL;
+            TOKEN_ELEVATION_TYPE et;
+            DWORD n = 0;
+            if (GetTokenInformation(tok, TokenElevationType, &et, sizeof(et), &n)
+                && et == TokenElevationTypeLimited) {
+                TOKEN_LINKED_TOKEN lt;
+                if (GetTokenInformation(tok, TokenLinkedToken, &lt, sizeof(lt), &n)) {
+                    linked = lt.LinkedToken;
+                    check = linked;
+                }
+            }
+            BOOL member = FALSE;
+            HANDLE imp = NULL;
+            if (DuplicateToken(check, SecurityIdentification, &imp)) {
+                BYTE sid[SECURITY_MAX_SID_SIZE];
+                DWORD sz = sizeof(sid);
+                if (CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, sid, &sz))
+                    CheckTokenMembership(imp, sid, &member);
+                CloseHandle(imp);
+            }
+            if (linked) CloseHandle(linked);
+            CloseHandle(tok);
+            return member ? 1 : 0;
+        #else
+            return 0;
+        #endif
+        }
+    }
+
+    // Show a message box on `sessionId`'s desktop from session 0
+    // (WTSSendMessage). Returns immediately; the box closes by itself
+    // after `timeoutSec` seconds (0 = stays until clicked). False if
+    // the session doesn't exist or the call is refused.
+    public static bool SendMessage(sessionId: int, title: string, message: string, timeoutSec: int) {
+        @c {
+        #ifdef _WIN32
+            Amalgame_Service_WtsLoad();
+            if (!Amalgame_Service_WtsSendMsg) return 0;
+            wchar_t* t = Amalgame_Service_U2W(title);
+            wchar_t* m = Amalgame_Service_U2W(message);
+            DWORD resp = 0;
+            /* Lengths are in BYTES for the W variant. */
+            BOOL ok = Amalgame_Service_WtsSendMsg(WTS_CURRENT_SERVER_HANDLE, (DWORD) sessionId,
+                t, (DWORD) (wcslen(t) * sizeof(wchar_t)),
+                m, (DWORD) (wcslen(m) * sizeof(wchar_t)),
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                (DWORD) (timeoutSec > 0 ? timeoutSec : 0), &resp, FALSE);
+            return ok ? 1 : 0;
+        #else
+            return 0;
+        #endif
+        }
+    }
+
+    // Make the SCM restart service `name` when it crashes: after
+    // `delayMs`, twice, then after 12 × `delayMs`; the failure count
+    // resets after `resetSeconds` without failure. Call it from the
+    // service itself (LocalSystem may reconfigure its own service).
+    // Installers' failure-action tables (MSI MsiServiceConfigFailure-
+    // Actions) are fragile — error 1939 aborts the whole install.
+    // False on POSIX or when the service can't be opened.
+    public static bool SetRestartOnFailure(name: string, delayMs: int, resetSeconds: int) {
+        @c {
+        #ifdef _WIN32
+            SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+            if (!scm) return 0;
+            SC_HANDLE svc = OpenServiceA(scm, name, SERVICE_CHANGE_CONFIG | SERVICE_START);
+            if (!svc) { CloseServiceHandle(scm); return 0; }
+            SC_ACTION acts[3];
+            acts[0].Type = SC_ACTION_RESTART; acts[0].Delay = (DWORD) delayMs;
+            acts[1].Type = SC_ACTION_RESTART; acts[1].Delay = (DWORD) delayMs;
+            acts[2].Type = SC_ACTION_RESTART; acts[2].Delay = (DWORD) (delayMs * 12);
+            SERVICE_FAILURE_ACTIONSA fa;
+            ZeroMemory(&fa, sizeof(fa));
+            fa.dwResetPeriod = (DWORD) resetSeconds;
+            fa.cActions = 3;
+            fa.lpsaActions = acts;
+            BOOL ok = ChangeServiceConfig2A(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return ok ? 1 : 0;
+        #else
+            (void) name; (void) delayMs; (void) resetSeconds;
+            return 0;
+        #endif
+        }
+    }
+
+    // Start `commandLine` as the user logged on to `sessionId`, on
+    // their interactive desktop, with their environment block and no
+    // console window. This is how a service shows UI (a toast, a
+    // tray agent, a browser) despite living in session 0. Returns
+    // the new process id, or 0 on failure. LocalSystem only.
+    public static int LaunchInSession(sessionId: int, commandLine: string) {
+        @c {
+        #ifdef _WIN32
+            HANDLE tok = Amalgame_Service_UserToken((DWORD) sessionId);
+            if (!tok) return 0;
+            HANDLE prim = NULL;
+            if (!DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityIdentification,
+                                  TokenPrimary, &prim)) {
+                CloseHandle(tok);
+                return 0;
+            }
+            LPVOID env = NULL;
+            if (Amalgame_Service_CreateEnv && !Amalgame_Service_CreateEnv(&env, prim, FALSE))
+                env = NULL;
+            STARTUPINFOW si;
+            ZeroMemory(&si, sizeof(si));
+            si.cb = sizeof(si);
+            si.lpDesktop = (LPWSTR) L"winsta0\\default";
+            PROCESS_INFORMATION pi;
+            ZeroMemory(&pi, sizeof(pi));
+            /* CreateProcessW may write into the command line buffer —
+             * U2W hands back a fresh writable copy. */
+            wchar_t* cmd = Amalgame_Service_U2W(commandLine);
+            DWORD flags = CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0);
+            i64 pid = 0;
+            if (CreateProcessAsUserW(prim, NULL, cmd, NULL, NULL, FALSE, flags, env,
+                                     NULL, &si, &pi)) {
+                pid = (i64) pi.dwProcessId;
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            if (env && Amalgame_Service_DestroyEnv) Amalgame_Service_DestroyEnv(env);
+            CloseHandle(prim);
+            CloseHandle(tok);
+            return pid;
+        #else
+            return 0;
+        #endif
+        }
+    }
+}

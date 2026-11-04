@@ -1,0 +1,594 @@
+namespace Amalgame.Bridge
+
+// ── Couche liaison : accès brut à l'interface désignée ────────────
+//
+// Trois backends derrière la même classe `LinkDevice` :
+//
+//   - "pcap"   Windows — Npcap (wpcap.dll), chargé dynamiquement au
+//              démarrage (LoadLibrary depuis System32\Npcap) : aucun
+//              SDK requis à la compilation, et un message clair si
+//              Npcap n'est pas installé.
+//   - "packet" Linux — socket AF_PACKET/SOCK_RAW liée à l'interface
+//              (CAP_NET_RAW requis). Sert au développement et aux
+//              essais sur un vrai réseau depuis Linux.
+//   - "null"   Aucune interface : rien n'est émis ni reçu. Sert à
+//              l'auto-test (connexions vers notre propre IP via la
+//              boucle locale lwIP), sans privilège ni réseau.
+//
+// Le filtrage d'entrée se fait en C, avant remise des trames à lwIP :
+// on ne remonte que les trames destinées à notre MAC (ou broadcast),
+// et pour l'IPv4 seulement celles adressées à notre IP (ou DHCP vers
+// le port 68 tant que l'adresse n'est pas acquise). En mode « MAC
+// partagée » (Wi-Fi), c'est ce filtre qui évite de faire traiter tout le
+// trafic de l'hôte dans la pile.
+
+@c {
+    #include <stdint.h>
+    #include <string.h>
+    #include <stdio.h>
+
+    #define BR_MAXDEV 4
+    #define BR_SNAP   2048
+
+    typedef struct {
+        int      used;
+        uint8_t  our_mac[6];
+        uint32_t our_ip;
+        int      filter_on;
+        uint64_t rx_frames, rx_dropped, tx_frames, tx_errors;
+    #ifdef _WIN32
+        void*    pcap;
+    #else
+        int      fd;
+        int      ifindex;
+    #endif
+    } br_dev_t;
+
+    static br_dev_t br_devs[BR_MAXDEV];
+    static char     br_link_err[512] = "";
+
+    static void br_set_err(const char* a, const char* b) {
+        snprintf(br_link_err, sizeof br_link_err, "%s%s", a ? a : "", b ? b : "");
+    }
+
+    static int br_dev_alloc(void) {
+        for (int i = 0; i < BR_MAXDEV; i++)
+            if (!br_devs[i].used) { memset(&br_devs[i], 0, sizeof br_devs[i]); br_devs[i].used = 1; return i; }
+        br_set_err("trop d'interfaces ouvertes", NULL);
+        return -1;
+    }
+
+    /* Vrai si la trame doit remonter à la pile. */
+    static int br_accept(br_dev_t* d, const uint8_t* f, int n) {
+        if (n < 14) return 0;
+        if (!d->filter_on) return 1;
+        static const uint8_t bc[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+        int to_us = memcmp(f, d->our_mac, 6) == 0;
+        int to_bc = memcmp(f, bc, 6) == 0;
+        if (!to_us && !to_bc) return 0;
+        if (memcmp(f + 6, d->our_mac, 6) == 0) return 0;      /* écho de nos propres trames */
+        uint16_t et = (uint16_t)((f[12] << 8) | f[13]);
+        if (et == 0x0806) return 1;                          /* ARP : la pile trie */
+        if (et != 0x0800 || n < 34) return 0;                /* IPv4 seulement */
+        const uint8_t* ip = f + 14;
+        uint32_t dst = ((uint32_t) ip[16] << 24) | (ip[17] << 16) | (ip[18] << 8) | ip[19];
+        if (d->our_ip != 0 && dst == d->our_ip) return 1;
+        if (dst == 0xffffffffu || to_us) {
+            /* DHCP (UDP → 68) accepté tant qu'on n'a pas d'adresse ou en broadcast. */
+            int ihl = (ip[0] & 15) * 4;
+            if (ip[9] == 17 && n >= 14 + ihl + 4) {
+                uint16_t dport = (uint16_t)((ip[ihl + 2] << 8) | ip[ihl + 3]);
+                if (dport == 68) return 1;
+            }
+            if (dst == 0xffffffffu && d->our_ip != 0) return 1; /* broadcast limité */
+        }
+        return 0;
+    }
+
+#ifdef _WIN32
+    /* ── Npcap, chargé dynamiquement ───────────────────────────── */
+    #include <iphlpapi.h>
+
+    typedef struct br_pcap_if {
+        struct br_pcap_if* next;
+        char* name;
+        char* description;
+        void* addresses;
+        uint32_t flags;
+    } br_pcap_if_t;
+    typedef struct { long tv_sec; long tv_usec; uint32_t caplen; uint32_t len; } br_pcap_hdr_t;
+
+    typedef int   (*br_findalldevs_fn)(br_pcap_if_t**, char*);
+    typedef void  (*br_freealldevs_fn)(br_pcap_if_t*);
+    typedef void* (*br_open_live_fn)(const char*, int, int, int, char*);
+    typedef int   (*br_setnonblock_fn)(void*, int, char*);
+    typedef int   (*br_next_ex_fn)(void*, br_pcap_hdr_t**, const uint8_t**);
+    typedef int   (*br_sendpacket_fn)(void*, const uint8_t*, int);
+    typedef void  (*br_close_fn)(void*);
+    typedef char* (*br_geterr_fn)(void*);
+    typedef int   (*br_setmintocopy_fn)(void*, int);
+
+    static HMODULE            br_wpcap = NULL;
+    static br_findalldevs_fn  p_findalldevs;
+    static br_freealldevs_fn  p_freealldevs;
+    static br_open_live_fn    p_open_live;
+    static br_setnonblock_fn  p_setnonblock;
+    static br_next_ex_fn      p_next_ex;
+    static br_sendpacket_fn   p_sendpacket;
+    static br_close_fn        p_close;
+    static br_geterr_fn       p_geterr;
+    static br_setmintocopy_fn p_setmintocopy;
+
+    static int br_pcap_load(void) {
+        if (br_wpcap) return 1;
+        char dir[MAX_PATH];
+        UINT n = GetSystemDirectoryA(dir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH - 8) {
+            strcat(dir, "\\Npcap");
+            SetDllDirectoryA(dir);
+        }
+        br_wpcap = LoadLibraryA("wpcap.dll");
+        SetDllDirectoryA(NULL);
+        if (!br_wpcap) {
+            br_set_err("wpcap.dll introuvable : installer Npcap (https://npcap.com) ", "en mode compatible WinPcap désactivé");
+            return 0;
+        }
+        p_findalldevs  = (br_findalldevs_fn)  GetProcAddress(br_wpcap, "pcap_findalldevs");
+        p_freealldevs  = (br_freealldevs_fn)  GetProcAddress(br_wpcap, "pcap_freealldevs");
+        p_open_live    = (br_open_live_fn)    GetProcAddress(br_wpcap, "pcap_open_live");
+        p_setnonblock  = (br_setnonblock_fn)  GetProcAddress(br_wpcap, "pcap_setnonblock");
+        p_next_ex      = (br_next_ex_fn)      GetProcAddress(br_wpcap, "pcap_next_ex");
+        p_sendpacket   = (br_sendpacket_fn)   GetProcAddress(br_wpcap, "pcap_sendpacket");
+        p_close        = (br_close_fn)        GetProcAddress(br_wpcap, "pcap_close");
+        p_geterr       = (br_geterr_fn)       GetProcAddress(br_wpcap, "pcap_geterr");
+        p_setmintocopy = (br_setmintocopy_fn) GetProcAddress(br_wpcap, "pcap_setmintocopy");
+        if (!p_findalldevs || !p_freealldevs || !p_open_live || !p_setnonblock ||
+            !p_next_ex || !p_sendpacket || !p_close || !p_geterr) {
+            br_set_err("wpcap.dll incomplet (version de Npcap trop ancienne ?)", NULL);
+            FreeLibrary(br_wpcap); br_wpcap = NULL;
+            return 0;
+        }
+        return 1;
+    }
+
+    static void br_wide_to_utf8(const wchar_t* w, char* out, int cap) {
+        out[0] = 0;
+        if (w) WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL);
+    }
+
+    /* Résout un nom fourni par l'utilisateur (nom convivial « Ethernet 2 »,
+     * GUID « {…} », description de la carte ou nom NPF complet) en
+     * nom de périphérique Npcap + adresse MAC. */
+    static int br_win_resolve(const char* want, char* npf, int npfcap, uint8_t mac[6], char* friendly, int fcap) {
+        ULONG size = 32 * 1024;
+        IP_ADAPTER_ADDRESSES* aa = NULL;
+        ULONG rc = ERROR_BUFFER_OVERFLOW;
+        for (int tries = 0; tries < 3 && rc == ERROR_BUFFER_OVERFLOW; tries++) {
+            aa = (IP_ADAPTER_ADDRESSES*) malloc(size);
+            if (!aa) return 0;
+            rc = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
+                                      | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size);
+            if (rc == ERROR_BUFFER_OVERFLOW) { free(aa); aa = NULL; }
+        }
+        if (rc != NO_ERROR || !aa) { if (aa) free(aa); br_set_err("GetAdaptersAddresses a échoué", NULL); return 0; }
+        int found = 0;
+        for (IP_ADAPTER_ADDRESSES* a = aa; a && !found; a = a->Next) {
+            char fn[256], desc[256], npfname[300];
+            br_wide_to_utf8(a->FriendlyName, fn, sizeof fn);
+            br_wide_to_utf8(a->Description, desc, sizeof desc);
+            snprintf(npfname, sizeof npfname, "\\Device\\NPF_%s", a->AdapterName);
+            if (_stricmp(want, fn) == 0 || _stricmp(want, a->AdapterName) == 0 ||
+                _stricmp(want, desc) == 0 || _stricmp(want, npfname) == 0) {
+                snprintf(npf, npfcap, "%s", npfname);
+                snprintf(friendly, fcap, "%s (%s)", fn, desc);
+                memset(mac, 0, 6);
+                if (a->PhysicalAddressLength >= 6) memcpy(mac, a->PhysicalAddress, 6);
+                found = 1;
+            }
+        }
+        free(aa);
+        if (!found) br_set_err("interface introuvable : ", want);
+        return found;
+    }
+
+    static IP_ADAPTER_ADDRESSES* br_win_adapters(void) {
+        ULONG size = 32 * 1024, rc = ERROR_BUFFER_OVERFLOW;
+        IP_ADAPTER_ADDRESSES* aa = NULL;
+        for (int tries = 0; tries < 3 && rc == ERROR_BUFFER_OVERFLOW; tries++) {
+            aa = (IP_ADAPTER_ADDRESSES*) malloc(size);
+            if (!aa) return NULL;
+            rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST
+                                      | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size);
+            if (rc != NO_ERROR) { free(aa); aa = NULL; }
+        }
+        return aa;
+    }
+
+    static int br_win_has_ipv4_gw(IP_ADAPTER_ADDRESSES* a) {
+        for (IP_ADAPTER_GATEWAY_ADDRESS_LH* g = a->FirstGatewayAddress; g; g = g->Next)
+            if (g->Address.lpSockaddr && g->Address.lpSockaddr->sa_family == AF_INET) return 1;
+        return 0;
+    }
+
+    /* Carte physique (Ethernet/Wi-Fi), active, avec IPv4 et passerelle.
+     * Les adaptateurs de tunnel/VPN et Bluetooth sont écartés. */
+    static int br_win_candidate(IP_ADAPTER_ADDRESSES* a) {
+        if (a->OperStatus != IfOperStatusUp) return 0;
+        if (a->IfType != IF_TYPE_ETHERNET_CSMACD && a->IfType != IF_TYPE_IEEE80211) return 0;
+        if (a->PhysicalAddressLength != 6 || !a->FirstUnicastAddress) return 0;
+        if (!br_win_has_ipv4_gw(a)) return 0;
+        char desc[256];
+        br_wide_to_utf8(a->Description, desc, sizeof desc);
+        static const char* skip[] = { "TAP-", "Wintun", "WireGuard", "Bluetooth", "Npcap Loopback", "OpenVPN", NULL };
+        for (int i = 0; skip[i]; i++) if (strstr(desc, skip[i])) return 0;
+        return 1;
+    }
+
+    /* Choix automatique : la carte que Windows utilise vers Internet
+     * (GetBestInterface) si elle est éligible, sinon la meilleure
+     * métrique IPv4 (Ethernet avant Wi-Fi à égalité). */
+    static int br_auto_select(char* out, int cap) {
+        IP_ADAPTER_ADDRESSES* aa = br_win_adapters();
+        if (!aa) { br_set_err("GetAdaptersAddresses a échoué", NULL); return 0; }
+        DWORD best = 0;
+        if (GetBestInterface(0x01010101, &best) != NO_ERROR) best = 0;
+        IP_ADAPTER_ADDRESSES* pick = NULL;
+        for (IP_ADAPTER_ADDRESSES* a = aa; a; a = a->Next) {
+            if (!br_win_candidate(a)) continue;
+            if (best && a->IfIndex == best) { pick = a; break; }
+            if (!pick || a->Ipv4Metric < pick->Ipv4Metric
+                || (a->Ipv4Metric == pick->Ipv4Metric && a->IfType == IF_TYPE_ETHERNET_CSMACD
+                    && pick->IfType != IF_TYPE_ETHERNET_CSMACD)) pick = a;
+        }
+        if (pick) br_wide_to_utf8(pick->FriendlyName, out, cap);
+        free(aa);
+        if (!pick) br_set_err("aucune carte Ethernet/Wi-Fi active avec passerelle", NULL);
+        return pick != NULL;
+    }
+
+    static int br_is_wireless(const char* want) {
+        IP_ADAPTER_ADDRESSES* aa = br_win_adapters();
+        int w = 0;
+        for (IP_ADAPTER_ADDRESSES* a = aa; a; a = a->Next) {
+            char fn[256], desc[256], npfname[300];
+            br_wide_to_utf8(a->FriendlyName, fn, sizeof fn);
+            br_wide_to_utf8(a->Description, desc, sizeof desc);
+            snprintf(npfname, sizeof npfname, "\\Device\\NPF_%s", a->AdapterName);
+            if (_stricmp(want, fn) == 0 || _stricmp(want, a->AdapterName) == 0 ||
+                _stricmp(want, desc) == 0 || _stricmp(want, npfname) == 0) {
+                w = a->IfType == IF_TYPE_IEEE80211;
+                break;
+            }
+        }
+        if (aa) free(aa);
+        return w;
+    }
+#else
+    /* ── Linux AF_PACKET ───────────────────────────────────────── */
+    #include <errno.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #include <sys/socket.h>
+    #include <sys/ioctl.h>
+    #include <net/if.h>
+    #include <ifaddrs.h>
+    #include <arpa/inet.h>
+    #include <linux/if_packet.h>
+    #include <linux/if_ether.h>
+    #include <net/if_arp.h>
+
+    /* Route par défaut de plus faible métrique sur une interface Ethernet
+     * (/proc/net/route : Iface Destination Gateway Flags … Metric …). */
+    static int br_auto_select(char* out, int cap) {
+        FILE* f = fopen("/proc/net/route", "r");
+        if (!f) { br_set_err("/proc/net/route illisible", NULL); return 0; }
+        char line[512], iface[64], best[64] = "";
+        unsigned long dst, gw, flags, refcnt, use, metric, bestMetric = ~0UL;
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (!fgets(line, sizeof line, f)) line[0] = 0;          /* en-tête */
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "%63s %lx %lx %lx %lu %lu %lu", iface, &dst, &gw, &flags, &refcnt, &use, &metric) != 7) continue;
+            if (dst != 0 || !(flags & 1) || !(flags & 2)) continue;       /* UP + GATEWAY */
+            struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+            snprintf(ifr.ifr_name, IFNAMSIZ, "%s", iface);
+            if (sock < 0 || ioctl(sock, SIOCGIFHWADDR, &ifr) != 0 || ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER) continue;
+            if (!strncmp(iface, "docker", 6) || !strncmp(iface, "veth", 4) || !strncmp(iface, "br-", 3)) continue;
+            if (metric < bestMetric) { bestMetric = metric; snprintf(best, sizeof best, "%s", iface); }
+        }
+        fclose(f);
+        if (sock >= 0) close(sock);
+        if (!best[0]) { br_set_err("aucune interface Ethernet avec route par défaut", NULL); return 0; }
+        snprintf(out, cap, "%s", best);
+        return 1;
+    }
+
+    static int br_is_wireless(const char* name) {
+        char path[160];
+        snprintf(path, sizeof path, "/sys/class/net/%s/wireless", name);
+        return access(path, F_OK) == 0;
+    }
+#endif
+}
+
+@c {
+    #include "bridge_lwip.h"
+
+    /* Émission d'une trame (callback tx de lwIP). ctx = handle + 1
+     * (0 = backend null : on jette la trame). */
+    static int br_link_tx(void* ctx, const uint8_t* f, int n) {
+        int h = (int)(intptr_t) ctx - 1;
+        if (h < 0) return 0;
+        br_dev_t* d = &br_devs[h];
+        uint8_t buf[BR_SNAP];
+        if (n > BR_SNAP) return -1;
+        memcpy(buf, f, (size_t) n);
+        if (n < 60) { memset(buf + n, 0, (size_t)(60 - n)); n = 60; }   /* bourrage Ethernet */
+    #ifdef _WIN32
+        if (p_sendpacket(d->pcap, buf, n) != 0) { d->tx_errors++; return -1; }
+    #else
+        struct sockaddr_ll sll; memset(&sll, 0, sizeof sll);
+        sll.sll_family = AF_PACKET; sll.sll_ifindex = d->ifindex; sll.sll_halen = 6;
+        memcpy(sll.sll_addr, buf, 6);
+        if (sendto(d->fd, buf, (size_t) n, 0, (struct sockaddr*) &sll, sizeof sll) < 0) { d->tx_errors++; return -1; }
+    #endif
+        d->tx_frames++;
+        return 0;
+    }
+
+    /* Transfère jusqu'à `budget` trames acceptées vers lwIP. */
+    static int br_link_pump(int h, int budget) {
+        if (h < 0) return 0;
+        br_dev_t* d = &br_devs[h];
+        int delivered = 0;
+        for (int i = 0; i < budget; i++) {
+    #ifdef _WIN32
+            br_pcap_hdr_t* hdr; const uint8_t* f;
+            if (p_next_ex(d->pcap, &hdr, &f) != 1) break;
+            int n = (int) hdr->caplen;
+    #else
+            uint8_t f[BR_SNAP];
+            struct sockaddr_ll from; socklen_t fl = sizeof from;
+            ssize_t rn = recvfrom(d->fd, f, sizeof f, 0, (struct sockaddr*) &from, &fl);
+            if (rn <= 0) break;
+            if (from.sll_pkttype == PACKET_OUTGOING) continue;
+            int n = (int) rn;
+    #endif
+            if (!br_accept(d, f, n)) { d->rx_dropped++; continue; }
+            d->rx_frames++;
+            brl_input(f, n);
+            delivered++;
+        }
+        return delivered;
+    }
+}
+
+public class LinkDevice {
+    public Kind:    string        // "pcap" | "packet" | "null"
+    public Name:    string        // nom résolu (affichage)
+    public Handle:  int           // index dans la table C (-1 pour null)
+    public HostMac: List<int>     // MAC matérielle de l'interface
+    public OurMac:  List<int>
+    public OurIp:   int
+
+    public LinkDevice(string kind, string name) {
+        this.Kind    = kind
+        this.Name    = name
+        this.Handle  = -1
+        this.HostMac = new List<int>()
+        this.OurMac  = new List<int>()
+        this.OurIp   = 0
+    }
+
+    // Ouvre l'interface physique désignée. null en cas d'échec :
+    // le détail est dans LinkDevice.LastError().
+    public static LinkDevice OpenPhysical(string name, bool promisc) {
+        let mac = new List<int>()
+        var handle: int = -1
+        var resolved: string = name
+        @c {
+            uint8_t m[6] = {0};
+        #ifdef _WIN32
+            char npf[300], friendly[600];
+            if (!br_pcap_load()) return NULL;
+            if (!br_win_resolve(name, npf, sizeof npf, m, friendly, sizeof friendly)) return NULL;
+            char errbuf[256] = "";
+            void* p = p_open_live(npf, BR_SNAP, promisc ? 1 : 0, 1, errbuf);
+            if (!p) { br_set_err("pcap_open_live : ", errbuf); return NULL; }
+            if (p_setnonblock(p, 1, errbuf) != 0) { br_set_err("pcap_setnonblock : ", errbuf); p_close(p); return NULL; }
+            if (p_setmintocopy) p_setmintocopy(p, 0);   /* latence minimale */
+            int h = br_dev_alloc();
+            if (h < 0) { p_close(p); return NULL; }
+            br_devs[h].pcap = p;
+            handle = h;
+            resolved = (code_string) GC_MALLOC_ATOMIC(strlen(friendly) + 1);
+            strcpy(resolved, friendly);
+        #else
+            int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+            if (fd < 0) { br_set_err("socket(AF_PACKET) : ", strerror(errno)); return NULL; }
+            struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+            snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+            if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) { br_set_err("interface introuvable : ", name); close(fd); return NULL; }
+            int ifindex = ifr.ifr_ifindex;
+            if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) memcpy(m, ifr.ifr_hwaddr.sa_data, 6);
+            struct sockaddr_ll sll; memset(&sll, 0, sizeof sll);
+            sll.sll_family = AF_PACKET; sll.sll_protocol = htons(ETH_P_ALL); sll.sll_ifindex = ifindex;
+            if (bind(fd, (struct sockaddr*) &sll, sizeof sll) < 0) { br_set_err("bind(AF_PACKET) : ", strerror(errno)); close(fd); return NULL; }
+            if (promisc) {
+                struct packet_mreq mr; memset(&mr, 0, sizeof mr);
+                mr.mr_ifindex = ifindex; mr.mr_type = PACKET_MR_PROMISC;
+                setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr, sizeof mr);
+            }
+            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+            int h = br_dev_alloc();
+            if (h < 0) { close(fd); return NULL; }
+            br_devs[h].fd = fd; br_devs[h].ifindex = ifindex;
+            handle = h;
+        #endif
+            for (int i = 0; i < 6; i++) AmalgameList_add(mac, (void*)(intptr_t) m[i]);
+        }
+        var kind: string = "packet"
+        @c {
+        #ifdef _WIN32
+            kind = "pcap";
+        #endif
+        }
+        let d = new LinkDevice(kind, resolved)
+        d.Handle  = handle
+        d.HostMac = mac
+        d.OurMac  = mac
+        return d
+    }
+
+    // Lien factice (auto-test) : la pile ne parle qu'à elle-même.
+    public static LinkDevice OpenNull(List<int> mac) {
+        let d = new LinkDevice("null", "null")
+        d.HostMac = mac
+        d.OurMac  = mac
+        return d
+    }
+
+    // Nom de la meilleure interface (route par défaut), "" si aucune.
+    public static string AutoSelect() {
+        @c {
+            char* out = (char*) GC_MALLOC_ATOMIC(256);
+            out[0] = 0;
+        #ifdef _WIN32
+            if (!br_pcap_load()) return "";
+        #endif
+            if (!br_auto_select(out, 256)) return "";
+            return out;
+        }
+    }
+
+    // Carte Wi-Fi ? (une seule MAC par station : impose mac = host)
+    public static bool IsWireless(string name) {
+        @c { return br_is_wireless(name) != 0; }
+    }
+
+    public static string LastError() {
+        @c { return br_link_err; }
+    }
+
+    // Liste lisible des interfaces utilisables (pour --list-interfaces).
+    public static List<string> ListInterfaces() {
+        let out = new List<string>()
+        @c {
+        #ifdef _WIN32
+            if (!br_pcap_load()) {
+                AmalgameList_add(out, (void*) br_link_err);
+                return out;
+            }
+            ULONG size = 64 * 1024;
+            IP_ADAPTER_ADDRESSES* aa = (IP_ADAPTER_ADDRESSES*) malloc(size);
+            if (aa && GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
+                                           | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) == NO_ERROR) {
+                for (IP_ADAPTER_ADDRESSES* a = aa; a; a = a->Next) {
+                    if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                    char fn[256], desc[256];
+                    br_wide_to_utf8(a->FriendlyName, fn, sizeof fn);
+                    br_wide_to_utf8(a->Description, desc, sizeof desc);
+                    char* line = (char*) GC_MALLOC_ATOMIC(900);
+                    const uint8_t* m = a->PhysicalAddress;
+                    snprintf(line, 900, "%-28s %02x:%02x:%02x:%02x:%02x:%02x  %s  %s  [%s]",
+                             fn, m[0], m[1], m[2], m[3], m[4], m[5],
+                             a->OperStatus == IfOperStatusUp ? "up  " : "down", a->AdapterName, desc);
+                    AmalgameList_add(out, (void*) line);
+                }
+            }
+            if (aa) free(aa);
+        #else
+            struct if_nameindex* ni = if_nameindex();
+            if (ni) {
+                int fd = socket(AF_INET, SOCK_DGRAM, 0);
+                for (struct if_nameindex* p = ni; p->if_index; p++) {
+                    struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+                    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", p->if_name);
+                    uint8_t m[6] = {0}; int up = 0;
+                    if (fd >= 0 && ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) memcpy(m, ifr.ifr_hwaddr.sa_data, 6);
+                    if (fd >= 0 && ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) up = (ifr.ifr_flags & IFF_UP) != 0;
+                    char* line = (char*) GC_MALLOC_ATOMIC(128);
+                    snprintf(line, 128, "%-16s %02x:%02x:%02x:%02x:%02x:%02x  %s",
+                             p->if_name, m[0], m[1], m[2], m[3], m[4], m[5], up ? "up" : "down");
+                    AmalgameList_add(out, (void*) line);
+                }
+                if (fd >= 0) close(fd);
+                if_freenameindex(ni);
+            }
+        #endif
+        }
+        return out
+    }
+
+    // Met à jour le filtre d'entrée C (MAC + IP de la pile).
+    public void SetIdentity(List<int> mac, int ip) {
+        this.OurMac = mac
+        this.OurIp  = ip
+        let h: int = this.Handle
+        if (h < 0) { return }
+        @c {
+            br_dev_t* d = &br_devs[h];
+            for (int i = 0; i < 6; i++) d->our_mac[i] = (uint8_t)((intptr_t) AmalgameList_get(mac, i) & 0xff);
+            d->our_ip = (uint32_t) ip;
+            d->filter_on = 1;
+        }
+    }
+
+    // Branche ce lien sous lwIP (émission) avec la MAC de la pile.
+    public bool StartStack(List<int> mac, int mtu, string hostname) {
+        this.SetIdentity(mac, 0)
+        let h: int = this.Handle
+        @c {
+            uint8_t m[6];
+            for (int i = 0; i < 6; i++) m[i] = (uint8_t)((intptr_t) AmalgameList_get(mac, i) & 0xff);
+            return brl_init(m, (int) mtu, hostname, br_link_tx, (void*)(intptr_t)(h + 1)) == 0;
+        }
+    }
+
+    // Remet les trames en attente à lwIP ; renvoie leur nombre.
+    public int Pump(int budget) {
+        let h: int = this.Handle
+        if (h < 0) { return 0 }
+        @c { return (i64) br_link_pump((int) h, (int) budget); }
+    }
+
+    // Descripteur pollable (Linux) pour select() ; -1 sinon.
+    public int Fd() {
+        let h: int = this.Handle
+        if (h < 0) { return -1 }
+        @c {
+        #ifdef _WIN32
+            return -1;
+        #else
+            return br_devs[h].fd;
+        #endif
+        }
+    }
+
+    public string Stats() {
+        let h: int = this.Handle
+        if (h < 0) { return "lien null" }
+        @c {
+            br_dev_t* d = &br_devs[h];
+            char* s = (char*) GC_MALLOC_ATOMIC(160);
+            snprintf(s, 160, "tx=%llu rx=%llu filtrées=%llu erreurs-tx=%llu",
+                     (unsigned long long) d->tx_frames, (unsigned long long) d->rx_frames,
+                     (unsigned long long) d->rx_dropped, (unsigned long long) d->tx_errors);
+            return s;
+        }
+    }
+
+    public void Close() {
+        let h: int = this.Handle
+        if (h < 0) { return }
+        @c {
+            br_dev_t* d = &br_devs[h];
+        #ifdef _WIN32
+            if (d->pcap) p_close(d->pcap);
+        #else
+            if (d->fd >= 0) close(d->fd);
+        #endif
+            d->used = 0;
+        }
+        this.Handle = -1
+    }
+}
