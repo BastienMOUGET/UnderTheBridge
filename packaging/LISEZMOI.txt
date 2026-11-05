@@ -108,9 +108,12 @@ Messages frequents :
     http://localhost:...
       Utilisez la derniere version de chrome-bridge.cmd.
 
-Changement de carte reseau (passage du Wi-Fi a l'Ethernet...) :
-  avec "interface = auto", la carte est choisie au demarrage du
-  service. Redemarrez-le : Restart-Service UnderTheBridge
+Changement de reseau : rien a faire. Le service surveille la carte
+  toutes les 5 secondes. Il redemande une adresse quand vous changez
+  de reseau Wi-Fi ou sortez de veille, et, avec "interface = auto",
+  bascule tout seul entre Wi-Fi et Ethernet. Les connexions en cours
+  sont alors coupees ; les applications se reconnectent.
+  Au demarrage du PC, le service attend que le reseau soit pret.
 
 Pour plus de details dans le journal : mettez log_level = debug dans
 bridge.conf, puis redemarrez le service.

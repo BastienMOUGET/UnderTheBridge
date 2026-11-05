@@ -113,8 +113,12 @@ if (-not $existing) {
     & sc.exe create $Name binPath= "`"$exe`"" start= auto depend= npcap DisplayName= "Under The Bridge" | Out-Null
     if ($LASTEXITCODE -ne 0) { Die "sc.exe create a echoue" }
     & sc.exe description $Name "Proxy local SOCKS5 / HTTP CONNECT (127.0.0.1:1080) ; le trafic sort par une pile TCP/IP dediee sur l'interface configuree." | Out-Null
-    & sc.exe failure $Name reset= 86400 actions= restart/5000/restart/5000/restart/30000 | Out-Null
 }
+# Demarrage differe (~2 min apres le boot, reseau en general pret) et
+# relance en cas d'echec. Applique aussi aux installations existantes.
+& sc.exe config $Name start= delayed-auto | Out-Null
+& sc.exe failure $Name reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+& sc.exe failureflag $Name 1 | Out-Null
 Start-Service $Name
 Start-Sleep -Seconds 1
 Get-Service $Name

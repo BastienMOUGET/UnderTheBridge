@@ -21,6 +21,16 @@ La pile a sa propre identité réseau :
 - **IP** : obtenue par son **propre bail DHCP**, avec détection de conflit RFC 5227. Une IP statique est aussi possible. Avec `mac = host`, la pile envoie l'option DHCP 61 (`dhcp_client_id = auto` → `bridge-<mac>`) pour que le routeur lui attribue un bail distinct de celui de Windows.
 - **DNS** : les serveurs reçus par DHCP. Les noms de domaine des requêtes SOCKS sont donc résolus sur l'interface désignée.
 
+## Surveillance du réseau
+
+- **Au démarrage**, si l'interface est indisponible (réseau pas encore prêt au boot, Npcap absent), le bridge réessaie toutes les 5 s au lieu de quitter. Le service est en démarrage différé (`delayed-auto`).
+- **En marche**, toutes les 5 s et sans aucun trafic, le bridge vérifie :
+  - l'état de la carte côté système (`down` ou `up`, avec la passerelle et le sous-réseau). Au retour sur le même réseau, la pile redemande son bail. Sur un autre réseau, elle repart de zéro : DHCP, ARP, adresse ;
+  - en mode `auto`, la meilleure carte. Un changement confirmé sur deux vérifications fait basculer la pile sur la nouvelle carte ;
+  - les erreurs de capture (carte retirée) : le bridge rouvre l'interface, ou attend qu'elle revienne. Pendant l'attente, les requêtes reçoivent `503`.
+- **Sortie de veille** : détectée par l'événement de reprise du service ou par un saut d'horloge de plus de 20 s. La pile revérifie alors son bail.
+- **Erreur fatale en service** : le processus se termine en échec pour que le SCM le relance. Sinon, Windows prendrait l'arrêt pour un arrêt normal.
+
 ## Arborescence
 
 | Chemin | Rôle |

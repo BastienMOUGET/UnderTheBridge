@@ -32,6 +32,16 @@ public class Net {
         @c { brl_poll(); }
     }
 
+    // Coupure/retour du lien : le DHCP redemande l'adresse en cours.
+    public static void LinkBounce() {
+        @c { brl_link_bounce(); }
+    }
+
+    // Lien perdu : pile détachée, adresse effacée.
+    public static void Detach() {
+        @c { brl_detach(); }
+    }
+
     public static void SetStatic(int ip, int mask, int gw) {
         @c { brl_set_static((uint32_t) ip, (uint32_t) mask, (uint32_t) gw); }
     }

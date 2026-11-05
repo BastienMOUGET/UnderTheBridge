@@ -129,6 +129,44 @@ int brl_init(const uint8_t mac[6], int mtu, const char* hostname, brl_tx_fn tx, 
     return 0;
 }
 
+/* Coupure/retour du lien : lwIP relance le DHCP en REBOOTING (redemande
+ * la même adresse ; un serveur d'un autre réseau répond NAK → DISCOVER). */
+void brl_link_bounce(void) {
+    if (!g_ready) return;
+    netif_set_link_down(&g_netif);
+    netif_set_link_up(&g_netif);
+}
+
+/* Remise à zéro complète : DHCP arrêté, ARP vidé, adresse effacée (les
+ * connexions TCP liées à l'ancienne IP sont abandonnées), puis nouvelle
+ * MAC / nouvelle sortie. L'appelant relance l'adressage. */
+void brl_rebind(const uint8_t mac[6], brl_tx_fn tx, void* ctx) {
+    if (!g_ready) return;
+    netif_set_link_down(&g_netif);
+    if (netif_dhcp_data(&g_netif)) dhcp_stop(&g_netif);
+    etharp_cleanup_netif(&g_netif);
+    ip4_addr_t z; ip4_addr_set_zero(&z);
+    netif_set_addr(&g_netif, &z, &z, &z);
+    memcpy(g_mac, mac, 6);
+    memcpy(g_netif.hwaddr, mac, 6);
+    g_tx = tx;
+    g_tx_ctx = ctx;
+    netif_set_link_up(&g_netif);
+}
+
+/* Lien perdu : plus d'émission, adresse effacée (les connexions TCP sont
+ * abandonnées, les nouvelles requêtes reçoivent « pas d'adresse »). */
+void brl_detach(void) {
+    if (!g_ready) return;
+    netif_set_link_down(&g_netif);
+    if (netif_dhcp_data(&g_netif)) dhcp_stop(&g_netif);
+    etharp_cleanup_netif(&g_netif);
+    ip4_addr_t z; ip4_addr_set_zero(&z);
+    netif_set_addr(&g_netif, &z, &z, &z);
+    g_tx = NULL;
+    g_tx_ctx = NULL;
+}
+
 void brl_input(const uint8_t* frame, int len) {
     if (!g_ready || len <= 0 || len > 1600) return;
     struct pbuf* p = pbuf_alloc(PBUF_RAW, (u16_t) len, PBUF_POOL);

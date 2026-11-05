@@ -18,6 +18,9 @@ int      brl_init(const uint8_t mac[6], int mtu, const char* hostname, brl_tx_fn
 void     brl_input(const uint8_t* frame, int len);   /* trame reçue */
 void     brl_poll(void);                             /* timers lwIP */
 void     brl_set_static(uint32_t ip, uint32_t mask, uint32_t gw);
+void     brl_link_bounce(void);
+void     brl_detach(void);
+void     brl_rebind(const uint8_t mac[6], brl_tx_fn tx, void* ctx);
 /* Identifiant client DHCP (option 61), à fixer avant brl_dhcp_start(). */
 void     brl_set_dhcp_client_id(const uint8_t* id, int len);
 int      brl_dhcp_start(void);

@@ -36,6 +36,7 @@ namespace Amalgame.Bridge
         uint32_t our_ip;
         int      filter_on;
         uint64_t rx_frames, rx_dropped, tx_frames, tx_errors;
+        int      failed;          /* capture en erreur (carte retirée…) */
     #ifdef _WIN32
         void*    pcap;
     #else
@@ -263,6 +264,36 @@ namespace Amalgame.Bridge
         if (aa) free(aa);
         return w;
     }
+
+    /* État vu par Windows : "absente", "down", ou "up gw=… net=…/…". */
+    static void br_host_state(const char* want, char* out, int cap) {
+        snprintf(out, cap, "absente");
+        IP_ADAPTER_ADDRESSES* aa = br_win_adapters();
+        for (IP_ADAPTER_ADDRESSES* a = aa; a; a = a->Next) {
+            char fn[256], desc[256], npfname[300];
+            br_wide_to_utf8(a->FriendlyName, fn, sizeof fn);
+            br_wide_to_utf8(a->Description, desc, sizeof desc);
+            snprintf(npfname, sizeof npfname, "\\Device\\NPF_%s", a->AdapterName);
+            if (_stricmp(want, fn) && _stricmp(want, a->AdapterName) && _stricmp(want, desc) && _stricmp(want, npfname)) continue;
+            if (a->OperStatus != IfOperStatusUp) { snprintf(out, cap, "down"); break; }
+            uint32_t gw = 0, ip = 0; int plen = 0;
+            for (IP_ADAPTER_GATEWAY_ADDRESS_LH* g = a->FirstGatewayAddress; g && !gw; g = g->Next)
+                if (g->Address.lpSockaddr && g->Address.lpSockaddr->sa_family == AF_INET)
+                    gw = ntohl(((struct sockaddr_in*) g->Address.lpSockaddr)->sin_addr.s_addr);
+            for (IP_ADAPTER_UNICAST_ADDRESS_LH* u = a->FirstUnicastAddress; u && !ip; u = u->Next)
+                if (u->Address.lpSockaddr && u->Address.lpSockaddr->sa_family == AF_INET) {
+                    ip = ntohl(((struct sockaddr_in*) u->Address.lpSockaddr)->sin_addr.s_addr);
+                    plen = u->OnLinkPrefixLength;
+                }
+            uint32_t mask = plen > 0 && plen <= 32 ? (uint32_t)(0xFFFFFFFFu << (32 - plen)) : 0;
+            uint32_t net = ip & mask;
+            snprintf(out, cap, "up gw=%u.%u.%u.%u net=%u.%u.%u.%u/%d",
+                     gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255,
+                     net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, plen);
+            break;
+        }
+        if (aa) free(aa);
+    }
 #else
     /* ── Linux AF_PACKET ───────────────────────────────────────── */
     #include <errno.h>
@@ -307,6 +338,35 @@ namespace Amalgame.Bridge
         snprintf(path, sizeof path, "/sys/class/net/%s/wireless", name);
         return access(path, F_OK) == 0;
     }
+
+    /* État vu par l'hôte : "absente", "down", ou "up gw=… net=…/…". */
+    static void br_host_state(const char* name, char* out, int cap) {
+        snprintf(out, cap, "absente");
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) return;
+        struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+        snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+        if (ioctl(sock, SIOCGIFFLAGS, &ifr) != 0) { close(sock); return; }
+        if (!(ifr.ifr_flags & IFF_UP) || !(ifr.ifr_flags & IFF_RUNNING)) { snprintf(out, cap, "down"); close(sock); return; }
+        uint32_t ip = 0, mask = 0, gw = 0;
+        if (ioctl(sock, SIOCGIFADDR, &ifr) == 0) ip = ntohl(((struct sockaddr_in*) &ifr.ifr_addr)->sin_addr.s_addr);
+        if (ioctl(sock, SIOCGIFNETMASK, &ifr) == 0) mask = ntohl(((struct sockaddr_in*) &ifr.ifr_netmask)->sin_addr.s_addr);
+        close(sock);
+        FILE* f = fopen("/proc/net/route", "r");
+        if (f) {
+            char line[512], iface[64]; unsigned long dst, g, flags;
+            if (!fgets(line, sizeof line, f)) line[0] = 0;
+            while (fgets(line, sizeof line, f))
+                if (sscanf(line, "%63s %lx %lx %lx", iface, &dst, &g, &flags) == 4
+                    && !strcmp(iface, name) && dst == 0 && (flags & 2)) { gw = ntohl((uint32_t) g); break; }
+            fclose(f);
+        }
+        int plen = 0; for (uint32_t m = mask; m & 0x80000000u; m <<= 1) plen++;
+        uint32_t net = ip & mask;
+        snprintf(out, cap, "up gw=%u.%u.%u.%u net=%u.%u.%u.%u/%d",
+                 gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255,
+                 net >> 24, (net >> 16) & 255, (net >> 8) & 255, net & 255, plen);
+    }
 #endif
 }
 
@@ -319,6 +379,7 @@ namespace Amalgame.Bridge
         int h = (int)(intptr_t) ctx - 1;
         if (h < 0) return 0;
         br_dev_t* d = &br_devs[h];
+        if (!d->used) return -1;            /* lien fermé (en cours de reprise) */
         uint8_t buf[BR_SNAP];
         if (n > BR_SNAP) return -1;
         memcpy(buf, f, (size_t) n);
@@ -343,12 +404,15 @@ namespace Amalgame.Bridge
         for (int i = 0; i < budget; i++) {
     #ifdef _WIN32
             br_pcap_hdr_t* hdr; const uint8_t* f;
-            if (p_next_ex(d->pcap, &hdr, &f) != 1) break;
+            int r = p_next_ex(d->pcap, &hdr, &f);
+            if (r < 0) { d->failed = 1; break; }
+            if (r != 1) break;
             int n = (int) hdr->caplen;
     #else
             uint8_t f[BR_SNAP];
             struct sockaddr_ll from; socklen_t fl = sizeof from;
             ssize_t rn = recvfrom(d->fd, f, sizeof f, 0, (struct sockaddr*) &from, &fl);
+            if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { d->failed = 1; break; }
             if (rn <= 0) break;
             if (from.sll_pkttype == PACKET_OUTGOING) continue;
             int n = (int) rn;
@@ -465,6 +529,16 @@ public class LinkDevice {
         @c { return br_is_wireless(name) != 0; }
     }
 
+    // État de la carte côté système : "absente", "down" ou
+    // "up gw=… net=…" (signature du réseau auquel elle est reliée).
+    public static string HostState(string name) {
+        @c {
+            char* out = (char*) GC_MALLOC_ATOMIC(96);
+            br_host_state(name, out, 96);
+            return out;
+        }
+    }
+
     public static string LastError() {
         @c { return br_link_err; }
     }
@@ -544,6 +618,25 @@ public class LinkDevice {
         }
     }
 
+    // Rebranche la pile (déjà initialisée) sur ce lien : nouvelle MAC,
+    // nouvelle sortie, adresse et DHCP remis à zéro.
+    public void Rebind(List<int> mac) {
+        this.SetIdentity(mac, 0)
+        let h: int = this.Handle
+        @c {
+            uint8_t m[6];
+            for (int i = 0; i < 6; i++) m[i] = (uint8_t)((intptr_t) AmalgameList_get(mac, i) & 0xff);
+            brl_rebind(m, br_link_tx, (void*)(intptr_t)(h + 1));
+        }
+    }
+
+    // Capture en erreur (carte retirée, pilote rechargé…).
+    public bool Failed() {
+        let h: int = this.Handle
+        if (h < 0) { return false }
+        @c { return br_devs[h].failed != 0; }
+    }
+
     // Remet les trames en attente à lwIP ; renvoie leur nombre.
     public int Pump(int budget) {
         let h: int = this.Handle
@@ -584,6 +677,7 @@ public class LinkDevice {
             br_dev_t* d = &br_devs[h];
         #ifdef _WIN32
             if (d->pcap) p_close(d->pcap);
+            d->pcap = NULL;
         #else
             if (d->fd >= 0) close(d->fd);
         #endif

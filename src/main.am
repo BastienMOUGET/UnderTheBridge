@@ -18,6 +18,13 @@ import Amalgame.Service
 public class Program {
     public static int Main(List<string> args) {
         let rc: int = Program.Entry(args)
+        if (rc != 0 && !Service.ShouldStop() && Service.IsRunningUnderScm()) {
+            // Arrêt sur erreur en service : sortie brutale, pour que le SCM
+            // y voie un échec et applique les actions de redémarrage (un
+            // arrêt « propre » serait pris pour volontaire).
+            Log.Error("arrêt sur erreur (code " + String.FromInt(rc) + ") : Windows va relancer le service")
+            @c { fflush(NULL); _exit((int) rc); }
+        }
         @c { Exit_Set(rc); }
         return rc
     }
@@ -105,6 +112,60 @@ public class Program {
         Console.WriteLine("  bridge --selftest [--port <socks>]")
     }
 
+    // Choisit (auto) puis ouvre l'interface ; null si indisponible
+    // (LinkDevice.LastError() dit pourquoi). link.OurMac = MAC de la pile.
+    private static LinkDevice OpenLink(BridgeConfig cfg) {
+        if (String.ToLower(cfg.Interface) == "auto") {
+            let best: string = LinkDevice.AutoSelect()
+            if (best == "") { return null }
+            Log.Info("interface = auto → " + best)
+            cfg.Interface = best
+        }
+        if (cfg.MacMode == "auto" && LinkDevice.IsWireless(cfg.Interface)) {
+            Log.Info("carte Wi-Fi : la pile utilise la MAC de la carte (mac = host)")
+            cfg.MacMode = "host"
+        }
+        // On ouvre d'abord sans promiscuité pour lire la MAC matérielle,
+        // puis on rouvre en promiscuité si la pile utilise une autre MAC.
+        let probe: LinkDevice = LinkDevice.OpenPhysical(cfg.Interface, false)
+        if (probe == null) { return null }
+        let mac: List<int> = cfg.ResolveMac(probe.HostMac)
+        let promisc: bool = !Addr.SameMac(mac, 0, probe.HostMac)
+        var link: LinkDevice = probe
+        if (promisc) {
+            probe.Close()
+            link = LinkDevice.OpenPhysical(cfg.Interface, true)
+            if (link == null) { return null }
+        }
+        link.OurMac = mac
+        Log.Info("interface " + link.Name + " — MAC carte " + Addr.Mac(link.HostMac)
+            + ", MAC pile " + Addr.Mac(mac) + (promisc ? " (promiscuité)" : " (partagée)"))
+        return link
+    }
+
+    // Adressage de la pile (statique ou DHCP) ; rappelée après un
+    // changement de carte ou de réseau.
+    private static bool StartAddressing(BridgeConfig cfg, List<int> mac, LinkDevice link) {
+        for k in 0..cfg.Dns.Count() {
+            if (k < 2) { Net.SetDnsServer(k, cfg.Dns.Get(k)) }
+        }
+        if (cfg.Mode == "static") {
+            Net.SetStatic(cfg.Ip, cfg.Mask, cfg.Gateway)
+            return true
+        }
+        let cid: List<int> = cfg.ResolveClientId(mac, link.HostMac)
+        Net.SetDhcpClientId(cid)
+        if (cid.Count() > 0) {
+            Log.Info("DHCP : identifiant client " + Bytes.Hex(cid, 0, cid.Count()))
+        }
+        if (!Net.DhcpStart()) {
+            Log.Error("démarrage DHCP impossible")
+            return false
+        }
+        Log.Info("DHCP : demande d'adresse en cours (hôte '" + cfg.Hostname + "')")
+        return true
+    }
+
     private static int Run(BridgeConfig cfg, bool selftest) {
         Service.RunAsService(cfg.ServiceName)
         Log.Info("amalgame-bridge démarre (service " + cfg.ServiceName + ")")
@@ -114,46 +175,36 @@ public class Program {
         }
 
         // ── Lien ──
+        let cfgWanted: string = cfg.Interface
+        let cfgMacMode: string = cfg.MacMode
         var link: LinkDevice = null
         var mac: List<int> = new List<int>()
         if (selftest) {
             mac = [0x02, 0x00, 0x5E, 0x10, 0x00, 0x01]
             link = LinkDevice.OpenNull(mac)
         } else {
-            if (String.ToLower(cfg.Interface) == "auto") {
-                let best: string = LinkDevice.AutoSelect()
-                if (best == "") {
-                    Log.Error("interface = auto : " + LinkDevice.LastError())
-                    return 1
+            // Au démarrage du PC, le réseau (Wi-Fi surtout) arrive souvent
+            // après le service : on attend l'interface au lieu de quitter.
+            var waitStart: int = Clock.NowMs()
+            var lastWaitLog: int = -60000
+            while (link == null) {
+                cfg.Interface = cfgWanted
+                cfg.MacMode = cfgMacMode
+                link = Program.OpenLink(cfg)
+                if (link != null) { break }
+                let now: int = Clock.NowMs()
+                if (now - lastWaitLog >= 60000) {
+                    Log.Warn("interface indisponible (" + LinkDevice.LastError()
+                        + ") : nouvel essai toutes les 5 s, réseau pas encore prêt ?")
+                    lastWaitLog = now
                 }
-                Log.Info("interface = auto → " + best)
-                cfg.Interface = best
+                Service.Sleep(5000)
+                if (Service.ShouldStop()) { return 0 }
             }
-            if (cfg.MacMode == "auto" && LinkDevice.IsWireless(cfg.Interface)) {
-                Log.Info("carte Wi-Fi : la pile utilise la MAC de la carte (mac = host)")
-                cfg.MacMode = "host"
+            if (Clock.NowMs() - waitStart > 1000) {
+                Log.Info("interface disponible après " + String.FromInt((Clock.NowMs() - waitStart) / 1000) + " s")
             }
-            // On ouvre d'abord sans promiscuité pour lire la MAC matérielle,
-            // puis on rouvre en promiscuité si la pile utilise une autre MAC.
-            let probe: LinkDevice = LinkDevice.OpenPhysical(cfg.Interface, false)
-            if (probe == null) {
-                Log.Error("interface '" + cfg.Interface + "' : " + LinkDevice.LastError())
-                return 1
-            }
-            mac = cfg.ResolveMac(probe.HostMac)
-            let promisc: bool = !Addr.SameMac(mac, 0, probe.HostMac)
-            if (promisc) {
-                probe.Close()
-                link = LinkDevice.OpenPhysical(cfg.Interface, true)
-                if (link == null) {
-                    Log.Error("interface '" + cfg.Interface + "' (promiscuité) : " + LinkDevice.LastError())
-                    return 1
-                }
-            } else {
-                link = probe
-            }
-            Log.Info("interface " + link.Name + " — MAC carte " + Addr.Mac(link.HostMac)
-                + ", MAC pile " + Addr.Mac(mac) + (promisc ? " (promiscuité)" : " (partagée)"))
+            mac = link.OurMac
         }
 
         // ── Pile ──
@@ -161,23 +212,7 @@ public class Program {
             Log.Error("initialisation lwIP impossible")
             return 1
         }
-        for k in 0..cfg.Dns.Count() {
-            if (k < 2) { Net.SetDnsServer(k, cfg.Dns.Get(k)) }
-        }
-        if (cfg.Mode == "static") {
-            Net.SetStatic(cfg.Ip, cfg.Mask, cfg.Gateway)
-        } else {
-            let cid: List<int> = cfg.ResolveClientId(mac, link.HostMac)
-            Net.SetDhcpClientId(cid)
-            if (cid.Count() > 0) {
-                Log.Info("DHCP : identifiant client " + Bytes.Hex(cid, 0, cid.Count()))
-            }
-            if (!Net.DhcpStart()) {
-                Log.Error("démarrage DHCP impossible")
-                return 1
-            }
-            Log.Info("DHCP : demande d'adresse en cours (hôte '" + cfg.Hostname + "')")
-        }
+        if (!Program.StartAddressing(cfg, mac, link)) { return 1 }
         if (selftest) {
             Net.ListenEcho(7)
             Log.Info("auto-test : echo TCP sur 10.255.0.1:7 (port 9 fermé → refus attendu)")
@@ -187,6 +222,23 @@ public class Program {
         let socks = new SocksServer(cfg.Socks)
         if (!socks.Start()) { return 1 }
 
+        // ── Surveillance réseau ──
+        // Toutes les 5 s, sans trafic : état de la carte côté système,
+        // meilleure carte (mode auto), erreur de capture, sortie de veille.
+        Service.EnableSessionEvents()
+        let wantedIf: string = String.ToLower(cfgWanted)
+        var hostSig: string = ""
+        var upSig: string = ""
+        if (!selftest) {
+            hostSig = LinkDevice.HostState(cfg.Interface)
+            if (String.StartsWith(hostSig, "up")) { upSig = hostSig }
+        }
+        var lastCheck: int = Clock.NowMs()
+        var lastTick: int = Clock.NowMs()
+        var pendingBest: string = ""
+        var linkLost: bool = false
+        var lastLostLog: int = -60000
+
         // ── Boucle ──
         var lastIp: int = -1
         var lastStats: int = Clock.NowMs()
@@ -194,7 +246,7 @@ public class Program {
         var loops: int = 0
         var lastDhcpLog: int = Clock.NowMs()
         while (!Service.ShouldStop()) {
-            link.Pump(512)
+            if (!linkLost) { link.Pump(512) }
             Net.Poll()
             let ip: int = Net.Ip()
             if (ip != lastIp) {
@@ -207,14 +259,97 @@ public class Program {
                     Log.Info("adresse " + Addr.Ip(ip) + "/" + Addr.Ip(Net.Mask()) + " passerelle " + Addr.Ip(Net.Gateway())
                         + " DNS " + Addr.Ip(Net.DnsServer(0)) + " " + Addr.Ip(Net.DnsServer(1)))
                 } else if (lastIp > 0) {
-                    Log.Warn("adresse perdue (bail expiré ?)")
+                    Log.Warn("adresse perdue")
                 }
                 lastIp = ip
             }
             let now: int = Clock.NowMs()
+
+            // ── Surveillance ──
+            if (!selftest) {
+                // Sortie de veille : saut d'horloge ou événement du SCM.
+                var resumed: bool = now - lastTick > 20000
+                lastTick = now
+                let evs: List<ServiceEvent> = Service.PollEvents()
+                for e in 0..evs.Count() {
+                    let ev: ServiceEvent = evs.Get(e)
+                    if (ev.Kind == "Resume") { resumed = true }
+                }
+                if (resumed || link.Failed() || now - lastCheck >= 5000) {
+                    lastCheck = now
+                    var reopen: string = ""
+                    if (linkLost) {
+                        reopen = "nouvel essai"
+                    } else if (link.Failed()) {
+                        reopen = "capture en erreur"
+                    }
+                    // Mode auto : la meilleure carte a changé (confirmé sur 2 tours).
+                    if (reopen == "" && wantedIf == "auto") {
+                        let best: string = LinkDevice.AutoSelect()
+                        if (best != "" && best != cfg.Interface) {
+                            if (best == pendingBest) {
+                                reopen = "meilleure carte : " + best
+                            }
+                            pendingBest = best
+                        } else {
+                            pendingBest = ""
+                        }
+                    }
+                    if (reopen == "") {
+                        let sig: string = LinkDevice.HostState(cfg.Interface)
+                        if (sig == "absente") {
+                            reopen = "carte " + cfg.Interface + " absente"
+                        } else if (sig != hostSig) {
+                            Log.Info("carte " + cfg.Interface + " : " + hostSig + " → " + sig)
+                            if (String.StartsWith(sig, "up")) {
+                                if (upSig != "" && sig != upSig) {
+                                    Log.Info("nouveau réseau : adresse redemandée")
+                                    link.Rebind(mac)
+                                    Program.StartAddressing(cfg, mac, link)
+                                } else {
+                                    Log.Info("lien revenu : bail vérifié")
+                                    Net.LinkBounce()
+                                }
+                                upSig = sig
+                            }
+                            hostSig = sig
+                        } else if (resumed) {
+                            Log.Info("sortie de veille : bail vérifié")
+                            Net.LinkBounce()
+                        }
+                    }
+                    if (reopen != "") {
+                        if (!linkLost) {
+                            Log.Warn("interface à rouvrir (" + reopen + ")")
+                            Net.Detach()
+                            link.Close()
+                            linkLost = true
+                        }
+                        cfg.Interface = cfgWanted
+                        cfg.MacMode = cfgMacMode
+                        let nl: LinkDevice = Program.OpenLink(cfg)
+                        if (nl != null) {
+                            link = nl
+                            mac = nl.OurMac
+                            linkLost = false
+                            pendingBest = ""
+                            link.Rebind(mac)
+                            Program.StartAddressing(cfg, mac, link)
+                            hostSig = LinkDevice.HostState(cfg.Interface)
+                            upSig = ""
+                            if (String.StartsWith(hostSig, "up")) { upSig = hostSig }
+                            lastIp = -1
+                        } else if (now - lastLostLog >= 60000) {
+                            Log.Warn("interface indisponible (" + LinkDevice.LastError() + ") : nouvel essai toutes les 5 s")
+                            lastLostLog = now
+                        }
+                    }
+                }
+            }
+
             socks.Poll(now)
             loops = loops + 1
-            if (ip == 0 && cfg.Mode == "dhcp" && now - lastDhcpLog >= 10000) {
+            if (ip == 0 && !linkLost && cfg.Mode == "dhcp" && now - lastDhcpLog >= 10000) {
                 Log.Info("DHCP : pas encore d'adresse — état " + Net.DhcpState())
                 lastDhcpLog = now
             }
@@ -228,11 +363,13 @@ public class Program {
                 Log.Info("stats : sessions=" + String.FromInt(socks.Sessions.Count()) + " " + link.Stats())
             }
             let fds: List<int> = socks.Fds()
-            let lfd: int = link.Fd()
+            var lfd: int = -1
+            if (!linkLost) { lfd = link.Fd() }
             if (lfd >= 0) { fds.Add(lfd) }
             // Windows : Npcap n'est pas pollable par select() → attente courte.
             var waitMs: int = 5
             if (link.Kind == "pcap") { waitMs = 1 }
+            if (linkLost) { waitMs = 50 }
             if (socks.Busy()) { waitMs = 0 }
             HostSock.Wait(fds, waitMs)
         }
@@ -240,7 +377,7 @@ public class Program {
         // ── Arrêt ──
         Log.Info("arrêt demandé")
         socks.Stop()
-        if (cfg.Mode == "dhcp") { Net.DhcpRelease() }
+        if (cfg.Mode == "dhcp" && !linkLost) { Net.DhcpRelease() }
         let until: int = Clock.NowMs() + 300
         while (Clock.NowMs() < until) {
             link.Pump(64)

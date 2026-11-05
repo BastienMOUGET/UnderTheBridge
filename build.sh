@@ -59,7 +59,7 @@ for f in $LWIP_SRCS; do
 done
 
 # ── Sources Amalgame (sys.am en premier : ordre des #include Windows) ──
-AM_SRCS="src/sys.am src/bytes.am src/link.am src/net.am src/hostsock.am src/socks.am src/config.am src/main.am $SVC/facade.am"
+AM_SRCS="src/sys.am src/bytes.am src/link.am src/net.am src/hostsock.am src/socks.am src/config.am $SVC/facade.am src/main.am"
 "$AMC" --quiet -o build/bridge $AM_SRCS
 
 # ── Édition de liens ──────────────────────────────────

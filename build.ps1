@@ -90,10 +90,11 @@ foreach ($f in $srcs) {
     $objs += [string]$o
 }
 
-# -- transpile (sys.am first: winsock2.h before windows.h; socks.am before config.am) --
+# -- transpile (sys.am first: winsock2.h before windows.h; socks.am before config.am;
+#    facade.am before main.am: ServiceEvent fields used there) --
 Log "amc"
 $am = @("src\sys.am", "src\bytes.am", "src\link.am", "src\net.am", "src\hostsock.am",
-        "src\socks.am", "src\config.am", "src\main.am", "vendor\amalgame-service\facade.am")
+        "src\socks.am", "src\config.am", "vendor\amalgame-service\facade.am", "src\main.am")
 Remove-Item build\bridge.c -ErrorAction SilentlyContinue
 & $amc --quiet -o "build\bridge" @am
 if (-not (Test-Path "build\bridge.c")) { Die "amc n'a pas produit build\bridge.c" }
