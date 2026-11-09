@@ -6,13 +6,13 @@
 # under "C:\Program Files\...").
 #
 # Usage: double-click build.cmd, or
-#   powershell -ExecutionPolicy Bypass -File build.ps1 [-Debug]
+#   powershell -ExecutionPolicy Bypass -File build.ps1 [-Debug] [-Version 2026.11.09]
 # Overrides: $env:AMC (path to amc.exe), $env:GCC_BIN (folder holding gcc.exe).
 #
 # Npcap is NOT needed to build (wpcap.dll is loaded at run time), only to run.
 #
 # Keep this file ASCII: Windows PowerShell 5.1 reads BOM-less scripts as ANSI.
-param([switch]$Debug)
+param([switch]$Debug, [string]$Version = (Get-Date -Format "yyyy.MM.dd"))
 
 # "Continue", not "Stop": PowerShell 5.1 turns any stderr line of a native
 # program into a terminating error. Failures go through $LASTEXITCODE.
@@ -95,14 +95,60 @@ foreach ($f in $srcs) {
 Log "amc"
 $am = @("src\sys.am", "src\bytes.am", "src\link.am", "src\net.am", "src\hostsock.am",
         "src\socks.am", "src\config.am", "vendor\amalgame-service\facade.am", "src\main.am")
-Remove-Item build\bridge.c -ErrorAction SilentlyContinue
+Remove-Item build\bridge.c, build\bridge_res.o -ErrorAction SilentlyContinue
 & $amc --quiet -o "build\bridge" @am
 if (-not (Test-Path "build\bridge.c")) { Die "amc n'a pas produit build\bridge.c" }
+
+# -- ressources Windows : version, editeur (MinGW ajoute deja un manifeste) --
+# Un exe sans aucune metadonnee est plus suspect aux yeux des antivirus.
+$resObj = @()
+$windres = Join-Path $gccBin "windres.exe"
+if (Test-Path $windres) {
+    $v = @($Version -split "[^0-9]+" | Where-Object { $_ -ne "" } | ForEach-Object { [int]$_ })
+    while ($v.Count -lt 4) { $v += 0 }
+    $vc = ($v[0..3] -join ","); $vs = ($v[0..3] -join ".")
+    $rc = @"
+#include <winver.h>
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION $vc
+PRODUCTVERSION $vc
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040C04B0"
+    BEGIN
+      VALUE "CompanyName", "Bastien MOUGET"
+      VALUE "FileDescription", "Under The Bridge - proxy local SOCKS5/HTTP sur interface dediee"
+      VALUE "FileVersion", "$Version"
+      VALUE "InternalName", "bridge"
+      VALUE "LegalCopyright", "Copyright 2026 Bastien MOUGET - Apache License 2.0"
+      VALUE "OriginalFilename", "bridge.exe"
+      VALUE "ProductName", "Under The Bridge"
+      VALUE "ProductVersion", "$Version"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x040C, 1200
+  END
+END
+"@
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot "build\bridge.rc"), $rc)
+    Push-Location build
+    & $windres --input-format=rc -O coff -i bridge.rc -o bridge_res.o 2>&1 | ForEach-Object { Write-Host $_ }
+    Pop-Location
+    if (Test-Path "build\bridge_res.o") { $resObj = @("build\bridge_res.o"); Log "ressources Windows (version $Version)" }
+    else { Write-Host "!  windres a echoue : exe sans informations de version" -ForegroundColor Yellow }
+} else {
+    Write-Host "!  windres absent : exe sans informations de version" -ForegroundColor Yellow
+}
 
 # -- link --
 Log "gcc (edition de liens)"
 [string[]]$linkArgs = $opt + @("-pthread", "-w", "-Isrc\native", "-I$lw\include", "-I$runtime",
-                               "build\bridge.c") + [string[]]$objs + @([string]$libamalgame,
+                               "build\bridge.c") + [string[]]$objs + [string[]]$resObj + @([string]$libamalgame,
                                "-lgc", "-lm", "-lws2_32", "-liphlpapi", "-ladvapi32", "-o", "build\bridge.exe")
 RunGcc $linkArgs "edition de liens"
 if (-not (Test-Path "build\bridge.exe")) { Die "build\bridge.exe absent apres gcc" }

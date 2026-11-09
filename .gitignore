@@ -3,3 +3,4 @@
 bridge.conf
 *.log
 /package/
+Capture*.png

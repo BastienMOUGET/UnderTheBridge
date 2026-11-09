@@ -96,6 +96,23 @@ Le script compile, puis produit `package\UnderTheBridge-<version>.zip` et son `.
 
 Le `dist\bridge.conf` personnel n'est jamais inclus.
 
+## Installation, antivirus et SmartScreen
+
+`install.cmd`, lancé depuis le package :
+- s'élève en administrateur ;
+- installe Npcap s'il manque : l'installeur est téléchargé depuis npcap.com, sa signature « Nmap Software » est vérifiée, puis son assistant s'ouvre. La licence gratuite de Npcap interdit de l'inclure dans le zip et réserve l'installation silencieuse à l'édition OEM ;
+- installe le service ;
+- crée le raccourci **Chrome (Under The Bridge)** sur le Bureau de l'utilisateur connecté, même si l'élévation s'est faite avec un autre compte ;
+- propose de configurer Claude Code : `HTTPS_PROXY` et `NO_PROXY` sont ajoutés à `~/.claude/settings.json` de cet utilisateur, et une copie `.bak` du fichier est gardée.
+
+`uninstall.cmd` défait tout cela, sauf Npcap.
+
+`bridge.exe` n'est pas signé. Ce qui limite les alertes sans signature :
+- **SmartScreen** (« Windows a protégé votre ordinateur ») vient de la marque « téléchargé depuis Internet ». Débloquer le zip avant de le décompresser (Propriétés → Débloquer) supprime l'alerte. `install.ps1` retire aussi cette marque des fichiers installés.
+- **Informations de version** : `build.ps1` les intègre à l'exe via `windres` (éditeur, produit, version). Un exe sans métadonnées est plus suspect aux yeux des heuristiques.
+- **Faux positif Microsoft Defender** : soumettre le zip sur https://www.microsoft.com/wdsi/filesubmission (« Incorrectly detected as malware »). C'est gratuit, et la correction vaut pour tous les utilisateurs de Defender, en général sous quelques jours. À refaire à chaque nouvelle version, car chaque compilation change l'empreinte du fichier.
+- **Pour aller plus loin** : la signature reste la seule façon de supprimer durablement les alertes. Les options les moins contraignantes sont SignPath Foundation (gratuit pour les projets open source, dépôt public requis) et Azure Trusted Signing (environ 10 $/mois). Un certificat auto-signé ne sert à rien hors de ta machine.
+
 ## Tests
 
 `tests/selftest_e2e.py` lance `bridge --selftest`. Ce mode n'a besoin ni de réseau ni de privilège : un lien factice, l'IP 10.255.0.1 et un serveur echo lwIP sur le port 7. Le script vérifie ensuite :

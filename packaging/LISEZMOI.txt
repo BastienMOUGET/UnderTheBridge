@@ -12,27 +12,36 @@ l'utilisent sortent sur Internet par la carte reseau de votre choix
 Le proxy n'est accessible que depuis votre PC.
 
 
-1. PREREQUIS
-------------
+1. AVANT DE DECOMPRESSER
+------------------------
 
-Installez Npcap : https://npcap.com
-Pendant son installation, laissez DECOCHEE l'option
-"Install Npcap in WinPcap API-compatible Mode".
+Faites un clic droit sur le fichier zip telecharge > Proprietes, cochez
+"Debloquer" en bas de la fenetre, puis OK. Decompressez ensuite.
+Sans cette etape, Windows affiche "Windows a protege votre ordinateur"
+au lancement (cliquez alors sur "Informations complementaires" puis
+"Executer quand meme").
 
 
 2. INSTALLATION
 ---------------
 
-1. Decompressez le zip dans un dossier.
-2. Double-cliquez sur install.cmd et acceptez la demande d'administrateur.
-3. La liste de vos cartes reseau s'affiche. Appuyez simplement sur
-   Entree : le service prendra automatiquement la carte qui vous sert
-   a aller sur Internet (Ethernet ou Wi-Fi), a chaque demarrage.
+1. Double-cliquez sur install.cmd et acceptez la demande d'administrateur.
+2. Si Npcap (le pilote reseau necessaire) n'est pas installe, il est
+   telecharge depuis npcap.com et son assistant s'ouvre : cliquez sur
+   "I Agree", "Install", puis "Finish". Les options par defaut
+   conviennent.
+3. La liste de vos cartes reseau s'affiche : appuyez simplement sur
+   Entree. Le service prendra la carte qui vous sert a aller sur
+   Internet (Ethernet ou Wi-Fi) et la suivra automatiquement.
    Pour imposer une carte precise, tapez son nom tel qu'il apparait
    dans la premiere colonne (exemples : Wi-Fi, Ethernet, Ethernet 2).
+4. Repondez Entree (oui) a "Configurer Claude Code" si vous utilisez
+   Claude Code.
 
-Le service "Under The Bridge" est alors installe. Il demarre
-automatiquement avec Windows.
+C'est tout. L'installation a :
+  - installe le service "Under The Bridge", qui demarre avec Windows ;
+  - cree sur le Bureau le raccourci "Chrome (Under The Bridge)" ;
+  - configure Claude Code (si vous l'avez accepte).
 
 Pour mettre a jour : decompressez la nouvelle version et relancez
 install.cmd. Votre configuration est conservee.
@@ -42,11 +51,9 @@ install.cmd. Votre configuration est conservee.
 ------------------------------
 
 Navigateur Chrome
-  Utilisez chrome-bridge.cmd. Il est copie dans
-  C:\Program Files\UnderTheBridge : vous pouvez creer un raccourci
-  vers ce fichier sur le Bureau.
-  Il ouvre un Chrome separe (profil distinct de votre Chrome habituel),
-  dont tout le trafic passe par le proxy.
+  Utilisez le raccourci "Chrome (Under The Bridge)" du Bureau. Il ouvre
+  un Chrome separe (profil distinct de votre Chrome habituel), dont
+  tout le trafic passe par le proxy.
 
 Firefox
   Parametres > Parametres reseau > Configuration manuelle du proxy :
@@ -54,7 +61,8 @@ Firefox
   Cochez "Utiliser un DNS distant lorsque SOCKS v5 est actif".
 
 Claude Code (terminal ou VS Code)
-  Ajoutez ceci dans %USERPROFILE%\.claude\settings.json :
+  Deja fait par l'installation si vous l'avez accepte. Sinon, ajoutez
+  ceci dans %USERPROFILE%\.claude\settings.json :
 
     {
       "env": {
@@ -94,6 +102,14 @@ Configuration (a modifier dans le Bloc-notes lance en administrateur) :
   administrateur :
     Restart-Service UnderTheBridge
 
+Antivirus d'entreprise ou de surveillance des comportements :
+  bridge.exe peut etre bloque comme "programme recemment trouve", car
+  il est peu repandu et non signe. Si le service ne demarre pas,
+  l'installation s'arrete et affiche le journal : demandez a
+  l'administrateur du poste
+  d'autoriser C:\Program Files\UnderTheBridge\bridge.exe.
+  Chaque nouvelle version peut demander une nouvelle autorisation.
+
 Messages frequents :
   - "503 ... pas encore d'adresse IP"
       Le service attend une adresse du reseau (DHCP). Patientez quelques
@@ -122,7 +138,9 @@ bridge.conf, puis redemarrez le service.
 6. DESINSTALLATION
 ------------------
 
-Double-cliquez sur uninstall.cmd. Le service est supprime ; vos
+Double-cliquez sur uninstall.cmd. Le service, le raccourci du Bureau
+et la configuration Claude Code sont supprimes. Npcap reste installe
+(Parametres > Applications pour le retirer). Vos
 fichiers restent dans C:\Program Files\UnderTheBridge et
 C:\ProgramData\UnderTheBridge, vous pouvez supprimer ces dossiers.
 

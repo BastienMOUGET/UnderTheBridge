@@ -19,7 +19,7 @@ function Die($m)  { Write-Host "x  $m" -ForegroundColor Red; exit 1 }
 
 if (-not $NoBuild) {
     Log "Compilation (build.ps1)"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build.ps1")
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build.ps1") -Version $Version
     if ($LASTEXITCODE -ne 0) { Die "build.ps1 a echoue" }
 }
 if (-not (Test-Path "dist\bridge.exe")) { Die "dist\bridge.exe absent : lancer build.cmd." }
@@ -42,9 +42,11 @@ Copy-Item LICENSE (Join-Path $stage "licenses\UnderTheBridge-LICENSE.txt")
 Copy-Item NOTICE (Join-Path $stage "licenses\UnderTheBridge-NOTICE.txt")
 Set-Content -Encoding ASCII (Join-Path $stage "VERSION.txt") "Under The Bridge $Version"
 
-# Controle rapide : l'exe demarre et l'auto-test de config passe.
-& (Join-Path $stage "bridge.exe") --help | Out-Null
-if ($LASTEXITCODE -ne 0) { Die "bridge.exe ne demarre pas depuis le package (DLL manquante ?)" }
+# Controle : les DLL dont depend l'exe sont presentes (sans le lancer : un
+# antivirus comportemental bloque les exe recents lances depuis PowerShell).
+foreach ($dll in (Get-ChildItem dist -Filter *.dll)) {
+    if (-not (Test-Path (Join-Path $stage $dll.Name))) { Die "$($dll.Name) manquante dans le package" }
+}
 
 Log "Compression"
 Compress-Archive -Path $stage -DestinationPath $zip
